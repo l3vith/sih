@@ -12,6 +12,44 @@ const model = 'openai/gpt-oss-120b'
 const embeddingModel = 'Xenova/all-MiniLM-L6-v2'
 const groq = process.env.GROQ_API_KEY ? new Groq({ apiKey: process.env.GROQ_API_KEY }) : null
 let extractorPromise
+// Osaurus local LLM fallback for LLM-only queries (http://127.0.0.1:1337)
+const osaurusUrl = process.env.OSAURUS_URL || 'http://127.0.0.1:1337'
+const osaurusModelEnv = process.env.OSAURUS_MODEL || 'gemma-4-e2b-it-8bit'
+let cachedOsaurusModel = null
+async function getOsaurusModel() {
+  if (cachedOsaurusModel) return cachedOsaurusModel
+  try {
+    const r = await fetch(`${osaurusUrl}/models`, { signal: AbortSignal.timeout(3000) })
+    if (r.ok) {
+      const j = await r.json()
+      const id = j?.data?.[0]?.id || j?.models?.[0]?.name || j?.models?.[0]?.id
+      if (id) { cachedOsaurusModel = id; return cachedOsaurusModel }
+    }
+  } catch {}
+  try {
+    const r = await fetch(`${osaurusUrl}/tags`, { signal: AbortSignal.timeout(3000) })
+    if (r.ok) {
+      const j = await r.json()
+      const id = j?.models?.[0]?.name || j?.models?.[0]?.id
+      if (id) { cachedOsaurusModel = id; return cachedOsaurusModel }
+    }
+  } catch {}
+  cachedOsaurusModel = osaurusModelEnv
+  return cachedOsaurusModel
+}
+async function osaurusChat({ messages, temperature = 0.05, max_tokens = 1200, response_format }) {
+  const mdl = await getOsaurusModel()
+  // Osaurus gemma with response_format:json_object is strict and can 400 on truncation – omit for fallback and rely on jsonFrom repair
+  const body = { model: mdl, messages, temperature, max_tokens }
+  // only pass response_format if caller explicitly wants it and model is not gemma fallback
+  if (response_format && mdl !== 'gemma-4-e2b-it-8bit') body.response_format = response_format
+  const res = await fetch(`${osaurusUrl}/chat/completions`, { method: 'POST', headers: { 'content-type': 'application/json' }, body: JSON.stringify(body), signal: AbortSignal.timeout(120000) })
+  if (!res.ok) throw new Error(`Osaurus ${res.status}: ${await res.text().then((t) => t.slice(0, 800))}`)
+  const data = await res.json()
+  const content = data?.choices?.[0]?.message?.content
+  if (!content) throw new Error('Osaurus returned empty content')
+  return content
+}
 const clean = (value) => String(value || '').toLowerCase().replace(/[^a-z0-9]+/g, ' ').trim()
 
 function jsonFrom(value) {
@@ -233,7 +271,7 @@ app.post('/api/structure-ddr', async (req, res) => {
     let report
     try {
       const completion = await groq.chat.completions.create({
-        model, temperature: 0.05, max_completion_tokens: 1800, response_format: { type: 'json_object' },
+        model, temperature: 0.05, max_completion_tokens: 3200, response_format: { type: 'json_object' },
         messages: [
           { role: 'system', content: 'You extract factual oil and gas drilling data. Never infer missing values. Use null or [] when the document does not explicitly contain a value. Return JSON only.' },
           { role: 'user', content: `Extract this drilling document using this exact schema:
@@ -248,8 +286,26 @@ OCR TEXT:\n${text}` },
     } catch (groqErr) {
       const msg = groqErr instanceof Error ? groqErr.message : String(groqErr)
       if (msg.includes('429') || msg.includes('rate_limit') || msg.includes('Rate limit')) {
-        console.warn('[structure-ddr] Groq rate limited, using fallback report for', text.slice(0, 30))
-        report = fallbackReport(text, headingCandidates)
+        console.warn('[structure-ddr] Groq rate limited, trying Osaurus fallback...')
+        try {
+          const osaurusContent = await osaurusChat({
+            messages: [
+              { role: 'system', content: 'You extract factual oil and gas drilling data. Never infer missing values. Use null or [] when the document does not explicitly contain a value. Return JSON only.' },
+              { role: 'user', content: `Extract this drilling document using this exact schema:
+{"well_name":string|null,"report_date":string|null,"report_number":string|null,"latitude":number|null,"longitude":number|null,"current_md":number|null,"current_tvd":number|null,"formation":string|null,"mud_weight":string|null,"operator":string|null,"rig_name":string|null,"lease_block":string|null,"progress":number|null,"avg_rop":number|null,"formations":[{"name":string,"top_md":number|null,"bottom_md":number|null}],"events":[{"time":string|null,"type":string,"depth":number|null,"severity":"high"|"medium"|"low"|null,"mitigation":string|null,"evidence":string}],"risks":[{"label":string,"probability":number|null,"trend":"rising"|"steady"|"falling"|null,"evidence":string}],"offset_wells":[{"id":string,"latitude":number|null,"longitude":number|null,"depth":number|null,"distance_km":number|null,"relationship":string|null}],"sections":[{"label":string,"anchor":string,"summary":string,"evidence":string}]}
+Probability must be null unless the document explicitly states a percentage. Preserve coordinate signs. Do not invent offset wells, depths, events, formations, or risks.
+The OCR layout detector found these top-level headings: ${JSON.stringify(headingCandidates)}
+sections MUST contain exactly one entry for every heading in that list, in document order. anchor must exactly copy that heading. label may normalize capitalization but not meaning. evidence must be a concise verbatim excerpt from that section.
+OCR TEXT:\n${text}` },
+            ],
+            temperature: 0.05, max_tokens: 1500,
+          })
+          report = jsonFrom(osaurusContent)
+          console.log('[structure-ddr] Osaurus fallback succeeded')
+        } catch (osaurusErr) {
+          console.warn('[structure-ddr] Osaurus fallback failed, using regex fallback:', osaurusErr instanceof Error ? osaurusErr.message : String(osaurusErr))
+          report = fallbackReport(text, headingCandidates)
+        }
       } else {
         throw groqErr
       }
@@ -270,9 +326,25 @@ app.post('/api/ask', async (req, res) => {
   const question = String(req.body?.question || '').slice(0, 3000)
   const corpus = String(req.body?.corpus || '').slice(0, 50000)
   if (!question || !corpus) return res.status(400).json({ error: 'Question and indexed document context are required.' })
+  const askMessages = [
+    { role: 'system', content: 'You are NWIS drilling decision support. Answer only from uploaded-document evidence. If evidence is insufficient, say so. Include Evidence and Recommended check sections. Never invent wells, depths, events, or probabilities.' },
+    { role: 'user', content: `UPLOADED DOCUMENT CONTEXT:\n${corpus}\n\nENGINEER QUESTION:\n${question}` },
+  ]
   try {
-    const response = await groq.chat.completions.create({ model, temperature: 0.1, max_completion_tokens: 1600, messages: [{ role: 'system', content: 'You are NWIS drilling decision support. Answer only from uploaded-document evidence. If evidence is insufficient, say so. Include Evidence and Recommended check sections. Never invent wells, depths, events, or probabilities.' }, { role: 'user', content: `UPLOADED DOCUMENT CONTEXT:\n${corpus}\n\nENGINEER QUESTION:\n${question}` }] })
-    res.json({ answer: response.choices[0]?.message?.content || 'No answer returned.' })
+    try {
+      const response = await groq.chat.completions.create({ model, temperature: 0.1, max_completion_tokens: 1600, messages: askMessages })
+      res.json({ answer: response.choices[0]?.message?.content || 'No answer returned.' })
+      return
+    } catch (groqErr) {
+      const msg = groqErr instanceof Error ? groqErr.message : String(groqErr)
+      if (msg.includes('429') || msg.includes('rate_limit') || msg.includes('Rate limit')) {
+        console.warn('[ask] Groq rate limited, trying Osaurus fallback...')
+        const answer = await osaurusChat({ messages: askMessages, temperature: 0.1, max_tokens: 800 })
+        res.json({ answer })
+        return
+      }
+      throw groqErr
+    }
   } catch (error) { res.status(500).json({ error: error instanceof Error ? error.message : 'Groq answer failed.' }) }
 })
 
