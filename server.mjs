@@ -185,11 +185,13 @@ function locateSegments(sections, words) {
     }).filter(({ score }) => score >= threshold).sort((a, b) => b.score - a.score)[0]?.word
     if (match) hits.push({ page: Number(match.page), x: 3.5, y: Math.max(0, Number(match.y) - .8), w: 93, h: 10, label: String(section.label || 'Section').toUpperCase(), tone: index % 2 ? 'amber' : 'cyan' })
   }
-  // If handwritten and still no hits (e.g., words are synthetic grid), fallback to even vertical distribution
-  if (hits.length === 0 && isHandwritten && sections.length > 0) {
+  // Fallback: if no heading/word matches (common for handwritten scans where OCR text diverges from anchor), distribute sections evenly so viewer always shows borders
+  if (hits.length === 0 && sections.length > 0) {
     const byPage = new Map()
+    // Group sections by page if we have any hit hints, else assume all on page 1 for single-page scans
+    const pageForFallback = words.length ? Math.min(...words.map((w) => Number(w.page) || 1)) : 1
     for (const s of sections) {
-      const p = 1
+      const p = pageForFallback
       if (!byPage.has(p)) byPage.set(p, [])
       byPage.get(p).push(s)
     }
