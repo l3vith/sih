@@ -27,25 +27,50 @@ function jsonFrom(value) {
 }
 
 function fallbackReport(text, headings) {
-  const pick = (re) => { const m = String(text).match(re); return m ? m[1].trim() : null }
-  const num = (re) => { const m = String(text).match(re); return m ? parseFloat(m[1].replace(/,/g, '')) : null }
-  const lat = num(/Latitude:\s*([\d.]+)/i)
-  const lon = num(/Longitude:\s*([\d.]+)/i)
+  const raw = String(text || '')
+  // Robust field extraction: take text between label: and next label: to handle inline table cells (pdfjs linearizes rows)
+  const nextLabelPattern = '(?:Report Date|API\\s*\\/\\s*UWI|Report No|Latitude|Spud Date|Longitude|Operator|Lease\\/Block|Rig Name|Current MD|Midnight MD|Current TVD|Progress|Avg ROP|Rotating Hours|Formation|Hole section|Mud Type|Mud Weight|Viscosity|PV\\s*\\/\\s*YP|Oil\\/Water Ratio|Chlorides|From|To|Hrs|Code|Operational Description|Interval|Observed condition|Risk interpretation|Time|Event|Depth|Severity|Mitigation|Survey MD|Inclination|Azimuth|TVD|Offset well|Planned casing|Setting depth|Cement objective|Watch item)\\s*(?:\\([^)]*\\))?\\s*:'
+  const fieldValue = (label) => {
+    const esc = label.replace(/[.*+?^${}()|[\]\\]/g, '\\$&')
+    const re = new RegExp(esc + '(?:\\s*\\([^)]*\\))?\\s*:\\s*', 'i')
+    const m = raw.match(re)
+    if (!m || m.index === undefined) return null
+    const start = m.index + m[0].length
+    const sub = raw.slice(start)
+    const probe = sub.slice(0, 600)
+    const nextRe = new RegExp(nextLabelPattern, 'i')
+    const nextIdx = probe.search(nextRe)
+    let val
+    if (nextIdx !== -1) val = sub.slice(0, nextIdx)
+    else {
+      const nl = sub.indexOf('\n')
+      val = nl !== -1 ? sub.slice(0, nl) : sub.slice(0, 120)
+    }
+    return val.trim().replace(/\s+/g, ' ').replace(/\[PAGE[^\]]*\]/gi, '').trim() || null
+  }
+  const num = (label) => {
+    const v = fieldValue(label)
+    if (!v) return null
+    const n = parseFloat(String(v).replace(/,/g, '').match(/[\d.]+/)?.[0] || '')
+    return Number.isFinite(n) ? n : null
+  }
+  const lat = num('Latitude')
+  const lon = num('Longitude')
   return {
-    well_name: pick(/Well Name:\s*([^\n]+)/i),
-    report_date: pick(/Report Date:\s*([^\n]+)/i),
-    report_number: pick(/Report No:\s*([^\n]+)/i),
+    well_name: fieldValue('Well Name'),
+    report_date: fieldValue('Report Date'),
+    report_number: fieldValue('Report No'),
     latitude: Number.isFinite(lat) ? lat : null,
     longitude: Number.isFinite(lon) ? lon : null,
-    current_md: num(/Current MD[^\n]*:\s*([\d,]+)/i),
-    current_tvd: num(/Current TVD[^\n]*:\s*([\d,]+)/i),
-    formation: pick(/Formation:\s*([^\n]+)/i),
-    mud_weight: pick(/Mud Weight[^\n]*:\s*([^\n]+)/i),
-    operator: pick(/Operator:\s*([^\n]+)/i),
-    rig_name: pick(/Rig Name:\s*([^\n]+)/i),
-    lease_block: pick(/Lease\/Block:\s*([^\n]+)/i),
-    progress: num(/Progress[^\n]*:\s*([\d,]+)/i),
-    avg_rop: num(/Avg ROP[^\n]*:\s*([\d.]+)/i),
+    current_md: num('Current MD'),
+    current_tvd: num('Current TVD'),
+    formation: fieldValue('Formation'),
+    mud_weight: fieldValue('Mud Weight'),
+    operator: fieldValue('Operator'),
+    rig_name: fieldValue('Rig Name'),
+    lease_block: fieldValue('Lease/Block'),
+    progress: num('Progress'),
+    avg_rop: num('Avg ROP'),
     formations: [],
     events: [],
     risks: [],
