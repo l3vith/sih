@@ -26,6 +26,34 @@ function jsonFrom(value) {
   }
 }
 
+function fallbackReport(text, headings) {
+  const pick = (re) => { const m = String(text).match(re); return m ? m[1].trim() : null }
+  const num = (re) => { const m = String(text).match(re); return m ? parseFloat(m[1].replace(/,/g, '')) : null }
+  const lat = num(/Latitude:\s*([\d.]+)/i)
+  const lon = num(/Longitude:\s*([\d.]+)/i)
+  return {
+    well_name: pick(/Well Name:\s*([^\n]+)/i),
+    report_date: pick(/Report Date:\s*([^\n]+)/i),
+    report_number: pick(/Report No:\s*([^\n]+)/i),
+    latitude: Number.isFinite(lat) ? lat : null,
+    longitude: Number.isFinite(lon) ? lon : null,
+    current_md: num(/Current MD[^\n]*:\s*([\d,]+)/i),
+    current_tvd: num(/Current TVD[^\n]*:\s*([\d,]+)/i),
+    formation: pick(/Formation:\s*([^\n]+)/i),
+    mud_weight: pick(/Mud Weight[^\n]*:\s*([^\n]+)/i),
+    operator: pick(/Operator:\s*([^\n]+)/i),
+    rig_name: pick(/Rig Name:\s*([^\n]+)/i),
+    lease_block: pick(/Lease\/Block:\s*([^\n]+)/i),
+    progress: num(/Progress[^\n]*:\s*([\d,]+)/i),
+    avg_rop: num(/Avg ROP[^\n]*:\s*([\d.]+)/i),
+    formations: [],
+    events: [],
+    risks: [],
+    offset_wells: [],
+    sections: headings.map((h) => ({ label: h, anchor: h, summary: '', evidence: String(text).slice(0, 400) })),
+  }
+}
+
 function isHeading(line) {
   if (line.length < 8 || line.length > 96 || !/[A-Z]{3}/.test(line)) return false
   if (/^(?:\[PAGE|PAGE \d|NWIS DEMO DATASET|DAILY DRILLING REPORT|DDR CONTINUATION|INTELLIGENCE$)/i.test(line)) return false
@@ -103,11 +131,11 @@ function semanticProjection(vectors) {
   return raw.map((point, index) => ({ x: 12 + ((point.x - xMin) / Math.max(.0001, xMax - xMin)) * 76, y: vectors.length === 2 ? 50 + (index ? 12 : -12) : 12 + ((point.y - yMin) / Math.max(.0001, yMax - yMin)) * 76 }))
 }
 
-function fallbackVectors(source) {
+function fallbackVectors(source, dim = 384) {
   // Deterministic hash-based vectors when the transformer model is offline – keeps the explorer usable without network.
   const vectors = source.map((entry) => {
     const text = String(entry.text || '').toLowerCase()
-    const hashed = Array.from({ length: 64 }, (_, i) => {
+    const hashed = Array.from({ length: dim }, (_, i) => {
       let h = 2166136261
       for (let c = 0; c < text.length; c += 1) h = Math.imul(h ^ text.charCodeAt(c + i * 7), 16777619)
       return ((h >>> 8) % 2000) / 1000 - 1
@@ -117,6 +145,37 @@ function fallbackVectors(source) {
   })
   const coordinates = semanticProjection(vectors)
   return { vectors, coordinates }
+}
+
+async function getDocumentVector(report, corpus) {
+  const docText = [
+    report.well_name, report.formation, report.lease_block, report.operator,
+    ...report.sections.map((s) => s.summary),
+    ...report.events.map((e) => `${e.type} ${e.evidence}`),
+    ...report.risks.map((r) => r.label),
+    String(corpus || '').slice(0, 1500),
+  ].filter(Boolean).join(' | ').slice(0, 2000)
+  if (!docText.trim()) return null
+  try {
+    extractorPromise ||= pipeline('feature-extraction', embeddingModel)
+    const extractor = await extractorPromise
+    const tensor = await extractor([docText], { pooling: 'mean', normalize: true })
+    const list = tensor.tolist()
+    // transformers.js returns [[...384]] for single input; handle both shapes
+    return Array.isArray(list[0]) ? list[0] : list
+  } catch (error) {
+    console.warn('[documentVector] transformer unavailable, using fallback:', error instanceof Error ? error.message : String(error))
+    extractorPromise = undefined
+    const text = docText.toLowerCase()
+    const dim = 384
+    const hashed = Array.from({ length: dim }, (_, i) => {
+      let h = 2166136261
+      for (let c = 0; c < text.length; c += 1) h = Math.imul(h ^ text.charCodeAt(c + i * 7), 16777619)
+      return ((h >>> 8) % 2000) / 1000 - 1
+    })
+    const norm = Math.hypot(...hashed) || 1
+    return hashed.map((v) => v / norm)
+  }
 }
 
 async function textEmbeddings(text, sections) {
@@ -132,7 +191,7 @@ async function textEmbeddings(text, sections) {
   } catch (error) {
     console.warn('[embeddings] transformer unavailable, using fallback vectors:', error instanceof Error ? error.message : String(error))
     extractorPromise = undefined
-    const { coordinates } = fallbackVectors(source)
+    const { coordinates } = fallbackVectors(source, 384)
     return source.map((entry, index) => ({ id: `chunk-${index + 1}`, label: String(entry.label || `Passage ${index + 1}`), excerpt: entry.text.slice(0, 240), x: coordinates[index].x, y: coordinates[index].y }))
   }
 }
@@ -141,31 +200,43 @@ app.get('/api/health', (_req, res) => res.json({ ready: Boolean(groq), model, em
 
 app.post('/api/structure-ddr', async (req, res) => {
   if (!groq) return res.status(503).json({ error: 'GROQ_API_KEY is not configured.' })
-  const text = String(req.body?.text || '').slice(0, 50000)
+  const text = String(req.body?.text || '').slice(0, 12000)
   const words = Array.isArray(req.body?.words) ? req.body.words.slice(0, 8000) : []
   if (!text.trim()) return res.status(400).json({ error: 'No OCR text supplied.' })
   try {
     const headingCandidates = detectHeadings(text, words)
-    const completion = await groq.chat.completions.create({
-      model, temperature: 0.05, max_completion_tokens: 3500, response_format: { type: 'json_object' },
-      messages: [
-        { role: 'system', content: 'You extract factual oil and gas drilling data. Never infer missing values. Use null or [] when the document does not explicitly contain a value. Return JSON only.' },
-        { role: 'user', content: `Extract this drilling document using this exact schema:
+    let report
+    try {
+      const completion = await groq.chat.completions.create({
+        model, temperature: 0.05, max_completion_tokens: 1800, response_format: { type: 'json_object' },
+        messages: [
+          { role: 'system', content: 'You extract factual oil and gas drilling data. Never infer missing values. Use null or [] when the document does not explicitly contain a value. Return JSON only.' },
+          { role: 'user', content: `Extract this drilling document using this exact schema:
 {"well_name":string|null,"report_date":string|null,"report_number":string|null,"latitude":number|null,"longitude":number|null,"current_md":number|null,"current_tvd":number|null,"formation":string|null,"mud_weight":string|null,"operator":string|null,"rig_name":string|null,"lease_block":string|null,"progress":number|null,"avg_rop":number|null,"formations":[{"name":string,"top_md":number|null,"bottom_md":number|null}],"events":[{"time":string|null,"type":string,"depth":number|null,"severity":"high"|"medium"|"low"|null,"mitigation":string|null,"evidence":string}],"risks":[{"label":string,"probability":number|null,"trend":"rising"|"steady"|"falling"|null,"evidence":string}],"offset_wells":[{"id":string,"latitude":number|null,"longitude":number|null,"depth":number|null,"distance_km":number|null,"relationship":string|null}],"sections":[{"label":string,"anchor":string,"summary":string,"evidence":string}]}
 Probability must be null unless the document explicitly states a percentage. Preserve coordinate signs. Do not invent offset wells, depths, events, formations, or risks.
 The OCR layout detector found these top-level headings: ${JSON.stringify(headingCandidates)}
 sections MUST contain exactly one entry for every heading in that list, in document order. anchor must exactly copy that heading. label may normalize capitalization but not meaning. evidence must be a concise verbatim excerpt from that section.
 OCR TEXT:\n${text}` },
-      ],
-    })
-    const report = jsonFrom(completion.choices[0]?.message?.content)
+        ],
+      })
+      report = jsonFrom(completion.choices[0]?.message?.content)
+    } catch (groqErr) {
+      const msg = groqErr instanceof Error ? groqErr.message : String(groqErr)
+      if (msg.includes('429') || msg.includes('rate_limit') || msg.includes('Rate limit')) {
+        console.warn('[structure-ddr] Groq rate limited, using fallback report for', text.slice(0, 30))
+        report = fallbackReport(text, headingCandidates)
+      } else {
+        throw groqErr
+      }
+    }
     // Ensure sections align with detected headings – groq may still miss one if OCR is noisy
     let sections = Array.isArray(report.sections) ? report.sections : []
     if (headingCandidates.length && sections.length !== headingCandidates.length) {
       console.warn(`[structure-ddr] heading/section mismatch: ${headingCandidates.length} headings vs ${sections.length} sections`)
     }
     const embeddings = await textEmbeddings(text, sections)
-    res.json({ report, segments: locateSegments(sections, words), embeddings, embeddingModel, corpus: text })
+    const documentVector = await getDocumentVector(report, text)
+    res.json({ report, segments: locateSegments(sections, words), embeddings, embeddingModel, corpus: text, documentVector })
   } catch (error) { res.status(500).json({ error: error instanceof Error ? error.message : 'Groq structuring failed.' }) }
 })
 

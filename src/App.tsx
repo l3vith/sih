@@ -29,7 +29,7 @@ type Report = {
   rig_name: string | null; lease_block: string | null; progress: number | null; avg_rop: number | null; formations: Formation[];
   events: Event[]; risks: Risk[]; offset_wells: OffsetWell[]; sections: Section[];
 }
-type Analysis = { report: Report; segments: Segment[]; embeddings: Embedding[]; embeddingModel: string; corpus: string }
+type Analysis = { report: Report; segments: Segment[]; embeddings: Embedding[]; embeddingModel: string; corpus: string; documentVector: number[] | null }
 type IndexedDocument = Analysis & { name: string; url: string; pages: number }
 type WordBox = { text: string; page: number; x: number; y: number; w: number; h: number }
 
@@ -48,6 +48,43 @@ const mapStyle: StyleSpecification = {
 }
 const value = (input: string | number | null | undefined, suffix = '') => input === null || input === undefined || input === '' ? 'Not found' : `${typeof input === 'number' ? input.toLocaleString() : input}${suffix}`
 const isImageFile = (file: File) => file.type.startsWith('image/') || /\.(png|jpe?g|tiff|bmp|webp)$/i.test(file.name)
+
+function semanticProjection(vectors: number[][]): { x: number; y: number }[] {
+  if (vectors.length === 1) return [{ x: 50, y: 50 }]
+  if (vectors.length === 2) {
+    // keep slight separation for 2 docs
+    const d = Math.hypot(...vectors[0].map((v, i) => v - vectors[1][i])) || 1
+    return d < 0.12 ? [{ x: 48, y: 50 }, { x: 52, y: 50 }] : [{ x: 38, y: 50 }, { x: 62, y: 50 }]
+  }
+  const dim = vectors[0].length
+  const mean = Array.from({ length: dim }, (_, di) => vectors.reduce((s, v) => s + v[di], 0) / vectors.length)
+  const centered = vectors.map((v) => v.map((val, di) => val - mean[di]))
+  const gram = centered.map((a) => centered.map((b) => a.reduce((s, val, di) => s + val * b[di], 0)))
+  const power = (matrix: number[][], seed: number) => {
+    let vec = matrix.map((_, idx) => Math.sin((idx + 1) * seed) + 0.1)
+    for (let it = 0; it < 60; it += 1) {
+      const nxt = matrix.map((row) => row.reduce((s, v, col) => s + v * vec[col], 0))
+      const norm = Math.hypot(...nxt) || 1
+      vec = nxt.map((v) => v / norm)
+    }
+    const prod = matrix.map((row) => row.reduce((s, v, col) => s + v * vec[col], 0))
+    const eigen = vec.reduce((s, v, idx) => s + v * prod[idx], 0)
+    return { vector: vec, eigenvalue: Math.max(0, eigen) }
+  }
+  const first = power(gram, 1.7)
+  const deflated = gram.map((row, i) => row.map((v, j) => v - first.eigenvalue * first.vector[i] * first.vector[j]))
+  const second = power(deflated, 2.3)
+  const raw = vectors.map((_, i) => ({ x: first.vector[i] * Math.sqrt(first.eigenvalue), y: second.vector[i] * Math.sqrt(second.eigenvalue) }))
+  const xs = raw.map((p) => p.x); const ys = raw.map((p) => p.y)
+  const xMin = Math.min(...xs); const xMax = Math.max(...xs); const yMin = Math.min(...ys); const yMax = Math.max(...ys)
+  return raw.map((p) => ({ x: 12 + ((p.x - xMin) / Math.max(0.0001, xMax - xMin)) * 76, y: 12 + ((p.y - yMin) / Math.max(0.0001, yMax - yMin)) * 76 }))
+}
+
+function cosine(a: number[], b: number[]) {
+  let dot = 0, na = 0, nb = 0
+  for (let i = 0; i < a.length; i++) { dot += a[i] * b[i]; na += a[i] * a[i]; nb += b[i] * b[i] }
+  return dot / (Math.sqrt(na) * Math.sqrt(nb) || 1)
+}
 
 async function analyseImage(file: File, onProgress: (progress: number, message: string) => void): Promise<{ analysis: Analysis; pages: number }> {
   onProgress(25, 'Running OCR on image document')
@@ -214,9 +251,37 @@ function RiskRow({ risks, events, openPrediction }: { risks: Risk[]; events: Eve
   return <section className="risk-row dynamic-risk-row"><div className="risk-label"><AlertTriangle size={25} /><div><small>DOCUMENT EVIDENCE</small><strong>RISK WATCH</strong></div></div>{risks.length ? risks.slice(0, 4).map((risk) => <button className={`risk-card ${risk.trend === 'rising' ? 'critical' : 'warning'}`} key={risk.label} title={risk.evidence}><div><small>{risk.label}</small><strong>{risk.probability === null ? '—' : `${risk.probability}%`}</strong><span className="risk-trend">TREND&nbsp; <b>{risk.trend || 'NOT STATED'}</b></span></div></button>) : <div className="no-risk-data">No risk probabilities were stated or extracted.</div>}<div className="alerts-card"><div><span className="alert-count">EVENTS ({events.length})</span>{events.slice(0, 2).map((event, index) => <span key={`${event.type}-${index}`}>{event.time || 'Time not stated'} · {event.type}{event.depth === null ? '' : ` @ ${event.depth.toLocaleString()} m`}</span>)}</div><button onClick={openPrediction}>ASK ABOUT EVENTS <ArrowUpRight size={13} /></button></div></section>
 }
 
-function EmbeddingPanel({ embeddings, model }: { embeddings: Embedding[]; model: string }) {
-  const [selected, setSelected] = useState<Embedding | null>(embeddings[0] || null)
-  return <><PanelHeader icon={<Network size={16} />} title="DOCUMENT TEXT VECTOR SPACE" meta={`${model} · ${embeddings.length} CHUNKS`} /><div className="embedding-canvas large-canvas"><div className="embedding-axis horizontal" /><div className="embedding-axis vertical" />{embeddings.map((point, index) => <button key={point.id} className={`embedding-point ${index % 3 === 0 ? 'coral' : index % 3 === 1 ? 'cyan' : 'amber'} ${selected?.id === point.id ? 'selected' : ''}`} style={{ left: `${point.x}%`, top: `${point.y}%` }} onClick={() => setSelected(point)} aria-label={point.label} />)}{selected && <div className="embedding-tooltip"><strong>{selected.label}</strong><span>{selected.excerpt}</span></div>}</div></>
+function EmbeddingPanel({ documents }: { documents: IndexedDocument[] }) {
+  const [selectedName, setSelectedName] = useState<string | null>(documents[0]?.name ?? null)
+  const vectors = useMemo(() => documents.map((d) => d.documentVector).filter((v): v is number[] => Array.isArray(v) && v.length > 0), [documents])
+  const positions = useMemo(() => {
+    if (vectors.length === 0) return [] as { x: number; y: number }[]
+    if (vectors.length === 1) return [{ x: 50, y: 50 }]
+    // if any doc missing vector (null), synthesize fallback hash to keep consistent dims – shouldn't happen after server fix
+    const filled = documents.map((d) => d.documentVector ?? Array(vectors[0].length).fill(0))
+    // need uniform dim – pad/truncate to first vector's dim
+    const dim = vectors[0].length
+    const uniform = filled.map((v) => v.slice(0, dim).concat(Array(Math.max(0, dim - v.length)).fill(0)))
+    return semanticProjection(uniform)
+  }, [documents, vectors])
+  const selected = useMemo(() => documents.find((d) => d.name === selectedName) ?? documents[0] ?? null, [documents, selectedName])
+  const model = documents[0]?.embeddingModel ?? '—'
+  if (documents.length === 0) {
+    return <><PanelHeader icon={<Network size={16} />} title="DOCUMENT TEXT VECTOR SPACE" meta="NO SITES INDEXED" /><div className="empty-workspace" style={{ minHeight: 320, border: 'none', background: '#fafaf8' }}><Network size={28} /><h2>No drilling sites indexed</h2><p>Ingest 2+ DDRs/WCRs to see document similarity. Similar sites cluster closer.</p></div></>
+  }
+  if (documents.length === 1) {
+    return <><PanelHeader icon={<Network size={16} />} title="DOCUMENT TEXT VECTOR SPACE" meta={`${model} · 1 SITE`} /><div className="embedding-canvas large-canvas"><div className="embedding-axis horizontal" /><div className="embedding-axis vertical" /><button className="embedding-point coral selected" style={{ left: '50%', top: '50%' }} aria-label={documents[0].report.well_name ?? documents[0].name} onClick={() => setSelectedName(documents[0].name)} /><div className="embedding-tooltip" style={{ left: '58%', top: '57%' }}><strong>{documents[0].report.well_name ?? documents[0].name}</strong><span>{documents[0].report.formation ?? 'Formation not stated'} · {value(documents[0].report.current_md, ' m')} · {documents[0].report.sections.length} sections</span><small>Upload another document to see distance.</small></div></div></>
+  }
+  return <><PanelHeader icon={<Network size={16} />} title="DOCUMENT TEXT VECTOR SPACE" meta={`${model} · ${documents.length} SITES`} /><div className="embedding-canvas large-canvas"><div className="embedding-axis horizontal" /><div className="embedding-axis vertical" />{documents.map((doc, idx) => {
+    const pos = positions[idx] ?? { x: 50, y: 50 }
+    const isSel = doc.name === selected?.name
+    const tone = doc.report.formation?.toLowerCase().includes('barail') ? 'coral' : doc.report.formation?.toLowerCase().includes('tipam') ? 'amber' : 'cyan'
+    return <button key={doc.name} className={`embedding-point ${tone} ${isSel ? 'selected' : ''}`} style={{ left: `${pos.x}%`, top: `${pos.y}%` }} onClick={() => setSelectedName(doc.name)} aria-label={doc.report.well_name ?? doc.name} title={`${doc.report.well_name ?? doc.name} – ${doc.report.formation ?? ''}`} />
+  })}{selected && (() => {
+    const selIdx = documents.findIndex((d) => d.name === selected.name)
+    const sims = documents.filter((d) => d.name !== selected.name).map((d) => ({ name: d.report.well_name ?? d.name, score: cosine(selected.documentVector ?? [], d.documentVector ?? []) })).sort((a, b) => b.score - a.score).slice(0, 2)
+    return <div className="embedding-tooltip"><strong>{selected.report.well_name ?? selected.name}</strong><span>{selected.report.formation ?? 'Formation not found'} · {value(selected.report.current_md, ' m')} · {selected.report.events.length} events</span><small style={{ display: 'block', marginTop: 6, color: '#7a8a87' }}>{sims.length ? `Closest: ${sims.map((s) => `${s.name} (${(s.score * 100).toFixed(1)}%)`).join(' · ')}` : 'No comparison'}</small></div>
+  })()}<div style={{ position: 'absolute', left: 10, bottom: 8, fontSize: 7, color: '#a0a6a2', letterSpacing: '.06em', fontWeight: 800 }}>CLOSER = MORE SIMILAR (COSINE)</div></div></>
 }
 
 function PredictionPanel({ document, question, setQuestion }: { document: IndexedDocument; question: string; setQuestion: (value: string) => void }) {
@@ -226,34 +291,57 @@ function PredictionPanel({ document, question, setQuestion }: { document: Indexe
 }
 
 export default function App() {
-  const [view, setView] = useState<View>('command'); const [sidebarOpen, setSidebarOpen] = useState(true); const [document, setDocument] = useState<IndexedDocument | null>(null); const [processing, setProcessing] = useState(false); const [progress, setProgress] = useState(0); const [status, setStatus] = useState('No document indexed'); const [error, setError] = useState(''); const [question, setQuestion] = useState(''); const [dragOver, setDragOver] = useState(false); const [fullscreen, setFullscreen] = useState(false)
-  const documentUrlRef = useRef<string | null>(null)
-  useEffect(() => () => { if (documentUrlRef.current) URL.revokeObjectURL(documentUrlRef.current) }, [])
+  const [view, setView] = useState<View>('command'); const [sidebarOpen, setSidebarOpen] = useState(true); const [documents, setDocuments] = useState<IndexedDocument[]>([]); const [activeName, setActiveName] = useState<string | null>(null); const [processing, setProcessing] = useState(false); const [progress, setProgress] = useState(0); const [status, setStatus] = useState('No document indexed'); const [error, setError] = useState(''); const [question, setQuestion] = useState(''); const [dragOver, setDragOver] = useState(false); const [fullscreen, setFullscreen] = useState(false)
+  const documentUrlMapRef = useRef<Map<string, string>>(new Map())
+  const document = useMemo(() => documents.find((d) => d.name === activeName) ?? documents[documents.length - 1] ?? null, [documents, activeName])
+  useEffect(() => () => { for (const url of documentUrlMapRef.current.values()) URL.revokeObjectURL(url) }, [])
   function toggleFullscreen() { if (!window.document.fullscreenElement) { window.document.documentElement.requestFullscreen?.() } else { window.document.exitFullscreen?.() }; setFullscreen((v) => !v) }
   useEffect(() => { function handleFullscreenChange() { setFullscreen(!!window.document.fullscreenElement) }; window.document.addEventListener('fullscreenchange', handleFullscreenChange); return () => window.document.removeEventListener('fullscreenchange', handleFullscreenChange) }, [])
   async function ingestFile(file: File) {
-    if (documentUrlRef.current) { URL.revokeObjectURL(documentUrlRef.current); documentUrlRef.current = null }
+    // allow re-ingesting same name: replace existing entry
     setProcessing(true); setProgress(1); setError(''); setStatus(`Opening ${file.name}`); setView('documents')
     try {
       const { analysis, pages } = await analyseDocument(file, (nextProgress, nextStatus) => { setProgress(nextProgress); setStatus(nextStatus) })
       const url = URL.createObjectURL(file)
-      documentUrlRef.current = url
-      setDocument({ ...analysis, name: file.name, url, pages }); setStatus(`Indexed ${analysis.report.sections.length} factual sections from ${pages} pages`)
-    } catch (uploadError) { setDocument(null); setError(uploadError instanceof Error ? uploadError.message : 'Document processing failed.'); setStatus('Document processing failed') } finally { setProcessing(false) }
+      // revoke previous url for same name if exists
+      const prev = documentUrlMapRef.current.get(file.name); if (prev) URL.revokeObjectURL(prev)
+      documentUrlMapRef.current.set(file.name, url)
+      const next: IndexedDocument = { ...analysis, name: file.name, url, pages }
+      setDocuments((prevDocs) => {
+        const others = prevDocs.filter((d) => d.name !== file.name)
+        return [...others, next]
+      })
+      setActiveName(file.name)
+      setStatus(`Indexed ${analysis.report.sections.length} factual sections from ${pages} pages`)
+    } catch (uploadError) { setError(uploadError instanceof Error ? uploadError.message : 'Document processing failed.'); setStatus('Document processing failed') } finally { setProcessing(false) }
   }
-  async function handleUpload(event: ChangeEvent<HTMLInputElement>) { const file = event.target.files?.[0]; if (!file) return; await ingestFile(file); event.target.value = '' }
+  async function handleUpload(event: ChangeEvent<HTMLInputElement>) { const files = event.target.files; if (!files || !files.length) return; await ingestFiles(files); event.target.value = '' }
+  // multi-file drag support
+  async function ingestFiles(files: FileList | File[]) {
+    for (const f of Array.from(files)) { // sequential to avoid Groq rate
+      // eslint-disable-next-line no-await-in-loop
+      await ingestFile(f)
+    }
+  }
   const report = document?.report
   const navItems: [View, ReactNode, string][] = [['command', <Crosshair size={17} />, 'Command Center'], ['documents', <FileScan size={17} />, 'Documents'], ['embeddings', <Network size={17} />, 'Embedding Explorer'], ['prediction', <BrainCircuit size={17} />, 'Prediction Mode']]
   function renderView() {
+    if (documents.length === 0) return <EmptyWorkspace view={view} />
     if (!document || !report) return <EmptyWorkspace view={view} />
     if (view === 'documents') return <div className="view-grid documents-view"><div className="panel document-panel"><DocumentPanel document={document} processing={processing} progress={progress} status={status} /></div><div className="panel activity-panel"><StreamPanel document={document} status={status} /></div></div>
-    if (view === 'embeddings') return <div className="view-grid embeddings-view"><div className="panel embeddings-panel"><EmbeddingPanel embeddings={document.embeddings} model={document.embeddingModel} /></div><div className="panel panel-copy"><PanelHeader icon={<MapPinned size={16} />} title="DOCUMENT WELL CONTEXT" meta={`${report.offset_wells.length} OFFSET REFERENCES`} /><h2>{report.well_name || 'Well name not found'}</h2><p>{report.lease_block || 'No lease or block was found in the document.'}</p><div className="linked-well-list">{report.offset_wells.length ? report.offset_wells.map((well) => <button key={well.id}><span>{well.id}</span><small>{value(well.depth, ' m')} · {value(well.distance_km, ' km')}</small><ArrowUpRight size={14} /></button>) : <p>No offset wells were explicitly identified.</p>}</div></div></div>
+    if (view === 'embeddings') {
+      const activeDoc = document
+      return <div className="view-grid embeddings-view"><div className="panel embeddings-panel"><EmbeddingPanel documents={documents} /></div><div className="panel panel-copy"><PanelHeader icon={<MapPinned size={16} />} title="DRILLING SITES" meta={`${documents.length} SITES INDEXED`} /><h2>{activeDoc.report.well_name ?? activeDoc.name}</h2><p>{activeDoc.report.lease_block ?? 'No lease/block'} · {activeDoc.report.formation ?? 'Formation not stated'} · Click a point to switch active site. Similar sites cluster closer.</p><div className="linked-well-list">{documents.map((doc) => {
+        const isActive = doc.name === activeDoc.name
+        return <button key={doc.name} className={isActive ? 'selected' : ''} onClick={() => setActiveName(doc.name)}><span>{doc.report.well_name ?? doc.name}</span><small>{value(doc.report.current_md, ' m')} · {doc.report.formation ?? '—'} · {doc.report.lease_block ?? ''}</small><ArrowUpRight size={14} /></button>
+      })}</div><p style={{ margin: '10px 17px', fontSize: 8, color: '#9a9e9c' }}>{documents[0]?.embeddingModel ?? ''} · cosine similarity · semanticProjection (PCA Gram)</p></div></div>
+    }
     if (view === 'prediction') return <div className="view-grid prediction-view"><div className="panel prediction-panel large"><PredictionPanel document={document} question={question} setQuestion={setQuestion} /></div><div className="panel panel-copy"><PanelHeader icon={<Bell size={16} />} title="EXTRACTED EVENTS" meta={`${report.events.length} FOUND`} /><div className="alert-log">{report.events.length ? report.events.map((event, index) => <span key={`${event.type}-${index}`}><b>{event.time || '—'}</b>{event.type}{event.depth === null ? '' : ` · ${event.depth.toLocaleString()} m`}</span>) : <span>No operational events found.</span>}</div></div></div>
     return <><div className="hero-grid"><div className={`panel map-panel ${fullscreen ? 'map-panel-fullscreen' : ''}`}><PanelHeader icon={<MapPinned size={16} />} title="DOCUMENT WELL LOCATIONS" meta={report.latitude === null || report.longitude === null ? 'COORDINATES NOT FOUND' : `${1 + report.offset_wells.filter((well) => well.latitude !== null && well.longitude !== null).length} MAPPED`} /><div className="map-toolbar"><span style={{ flex: 1 }} /><button className="icon-button" aria-label="Toggle fullscreen" onClick={toggleFullscreen}>{fullscreen ? <X size={15} /> : <Maximize2 size={15} />}</button></div><FieldMap report={report} fullscreen={fullscreen} /></div><div className="panel depth-panel"><DepthPanel report={report} /></div><div className="panel document-panel"><DocumentPanel document={document} processing={processing} progress={progress} status={status} /></div></div><RiskRow risks={report.risks || []} events={report.events || []} openPrediction={() => setView('prediction')} /><div className="lower-grid"><div className="panel activity-panel"><StreamPanel document={document} status={status} /></div><div className="panel prediction-panel"><PredictionPanel document={document} question={question} setQuestion={setQuestion} /></div></div></>
   }
   const heading = view === 'command' ? 'Operational evidence from uploaded documents.' : view === 'documents' ? 'Make every report searchable.' : view === 'embeddings' ? 'Explore this document’s evidence.' : 'Ask against indexed evidence.'
   function onDragOver(event: React.DragEvent) { event.preventDefault(); if (!dragOver) setDragOver(true) }
   function onDragLeave(event: React.DragEvent) { if (!(event.currentTarget as HTMLElement).contains(event.relatedTarget as Node)) setDragOver(false) }
-  async function onDrop(event: React.DragEvent) { event.preventDefault(); setDragOver(false); const file = event.dataTransfer.files?.[0]; if (file) await ingestFile(file) }
-  return <div className={`app-shell ${sidebarOpen ? '' : 'sidebar-collapsed'}` + (dragOver ? ' drag-active' : '')} onDragOver={onDragOver} onDragLeave={onDragLeave} onDrop={onDrop}><header className="topbar"><button className="sidebar-toggle" onClick={() => setSidebarOpen((open) => !open)} aria-label={sidebarOpen ? 'Collapse navigation' : 'Open navigation'}>{sidebarOpen ? <PanelLeftClose size={18} /> : <Menu size={18} />}</button><div className="brand-lockup"><div className="brand-mark">N°</div><div><div className="brand-title">NWIS</div><div className="brand-subtitle">NEARBY WELLS INTELLIGENCE</div></div></div><div className="top-search"><Search size={15} /><span>Search indexed document evidence…</span></div><div className="top-actions"><span className="online-pill"><i /> {processing ? `PROCESSING ${progress}%` : document ? 'DOCUMENT INDEXED' : 'AWAITING DOCUMENT'}</span><button aria-label="Notifications"><Bell size={17} /></button><button aria-label="Settings"><Settings2 size={17} /></button></div></header><div className="app-layout"><aside className="sidebar"><div className="sidebar-top"><span>WORKSPACE</span><button onClick={() => setSidebarOpen(false)} aria-label="Collapse sidebar"><PanelLeftClose size={15} /></button></div><nav>{navItems.map(([id, icon, label]) => <button key={id} className={view === id ? 'active' : ''} onClick={() => setView(id)}>{icon}<span>{label}</span></button>)}</nav><div className="sidebar-section"><span>ACTIVE WELL</span><button className="well-switch"><strong>{report?.well_name || 'No well indexed'}</strong><small>{report ? `${report.formation || 'Formation not found'} · ${value(report.current_md, ' m')}` : 'Upload a drilling document'}</small><ChevronDown size={14} /></button></div><div className="sidebar-section"><span>QUICK ACTIONS</span><label className="sidebar-upload" title="Select a PDF or image drilling report"><Upload size={15} /> Ingest document<input type="file" accept=".pdf,.png,.jpg,.jpeg,.tiff,.bmp,.webp" onChange={handleUpload} /></label><button disabled={!document} onClick={() => setView('prediction')}><Sparkles size={15} /> Ask NWIS</button></div><div className="sidebar-foot"><span><i className="online-dot" /> {processing ? status : document ? 'Index ready' : 'No dataset loaded'}</span><small>{document?.name || 'NO DOCUMENT'}</small></div></aside><main className="main-content"><div className="page-heading"><div><span className="eyebrow">{view === 'command' ? 'FIELD OVERVIEW' : view === 'documents' ? 'DOCUMENT INTELLIGENCE' : view === 'embeddings' ? 'EVIDENCE GRAPH' : 'DECISION SUPPORT'}</span><h1>{heading}</h1></div><span className="date-stamp">{report?.report_date || 'DATE NOT FOUND'}{report?.report_number ? ` / ${report.report_number}` : ''}</span></div>{error && <div className="pipeline-error"><AlertTriangle size={15} />{error}</div>}<div className="workspace">{renderView()}</div></main></div>{dragOver && <div className="drag-overlay"><Upload size={22} /><span>Drop DDR / WCR / scan to ingest</span></div>}<div className="status-footer"><span><i className="online-dot" /> {processing ? status : document ? 'INDEXED FROM UPLOADED DOCUMENT' : 'AWAITING UPLOAD'}</span><span><FileText size={12} /> {document?.name || 'No document indexed'}</span><span>{document ? `${document.report.sections.length} sections · ${document.report.events.length} events · ${document.embeddings.length} vectors` : 'No operational data loaded'}</span><CircleHelp size={13} /></div></div>
+  async function onDrop(event: React.DragEvent) { event.preventDefault(); setDragOver(false); const files = event.dataTransfer.files; if (files && files.length) await ingestFiles(files) }
+  return <div className={`app-shell ${sidebarOpen ? '' : 'sidebar-collapsed'}` + (dragOver ? ' drag-active' : '')} onDragOver={onDragOver} onDragLeave={onDragLeave} onDrop={onDrop}><header className="topbar"><button className="sidebar-toggle" onClick={() => setSidebarOpen((open) => !open)} aria-label={sidebarOpen ? 'Collapse navigation' : 'Open navigation'}>{sidebarOpen ? <PanelLeftClose size={18} /> : <Menu size={18} />}</button><div className="brand-lockup"><div className="brand-mark">N°</div><div><div className="brand-title">NWIS</div><div className="brand-subtitle">NEARBY WELLS INTELLIGENCE</div></div></div><div className="top-search"><Search size={15} /><span>Search indexed document evidence…</span></div><div className="top-actions"><span className="online-pill"><i /> {processing ? `PROCESSING ${progress}%` : documents.length ? `${documents.length} SITE(S) INDEXED` : 'AWAITING DOCUMENT'}</span><button aria-label="Notifications"><Bell size={17} /></button><button aria-label="Settings"><Settings2 size={17} /></button></div></header><div className="app-layout"><aside className="sidebar"><div className="sidebar-top"><span>WORKSPACE</span><button onClick={() => setSidebarOpen(false)} aria-label="Collapse sidebar"><PanelLeftClose size={15} /></button></div><nav>{navItems.map(([id, icon, label]) => <button key={id} className={view === id ? 'active' : ''} onClick={() => setView(id)}>{icon}<span>{label}</span></button>)}</nav><div className="sidebar-section"><span>ACTIVE WELL</span><button className="well-switch" onClick={() => setView('embeddings')}><strong>{report?.well_name || 'No well indexed'}</strong><small>{report ? `${report.formation || 'Formation not found'} · ${value(report.current_md, ' m')} · ${documents.length} site(s)` : 'Upload drilling documents'} </small><ChevronDown size={14} /></button>{documents.length > 1 && <div style={{ display: 'grid', gap: 4, marginTop: 6, maxHeight: 132, overflowY: 'auto' }}>{documents.map((doc) => <button key={doc.name} onClick={() => setActiveName(doc.name)} style={{ textAlign: 'left', padding: '6px 8px', borderRadius: 7, border: activeName===doc.name || (!activeName && doc.name===document?.name) ? '1px solid #f0c1b4' : '1px solid var(--line)', background: activeName===doc.name || (!activeName && doc.name===document?.name) ? 'var(--coral-soft)' : 'white', fontSize: 9 }}><strong style={{ display:'block', fontSize: 9 }}>{doc.report.well_name ?? doc.name}</strong><small style={{ color: '#8a8c89' }}>{doc.report.formation ?? '—'} · {value(doc.report.current_md, ' m')}</small></button>)}</div>}</div><div className="sidebar-section"><span>QUICK ACTIONS</span><label className="sidebar-upload" title="Select a PDF or image drilling report"><Upload size={15} /> Ingest document(s)<input type="file" multiple accept=".pdf,.png,.jpg,.jpeg,.tiff,.bmp,.webp" onChange={handleUpload} /></label><button disabled={!document} onClick={() => setView('prediction')}><Sparkles size={15} /> Ask NWIS</button></div><div className="sidebar-foot"><span><i className="online-dot" /> {processing ? status : document ? 'Index ready' : 'No dataset loaded'}</span><small>{document?.name || 'NO DOCUMENT'}</small></div></aside><main className="main-content"><div className="page-heading"><div><span className="eyebrow">{view === 'command' ? 'FIELD OVERVIEW' : view === 'documents' ? 'DOCUMENT INTELLIGENCE' : view === 'embeddings' ? 'EVIDENCE GRAPH' : 'DECISION SUPPORT'}</span><h1>{heading}</h1></div><span className="date-stamp">{report?.report_date || 'DATE NOT FOUND'}{report?.report_number ? ` / ${report.report_number}` : ''}</span></div>{error && <div className="pipeline-error"><AlertTriangle size={15} />{error}</div>}<div className="workspace">{renderView()}</div></main></div>{dragOver && <div className="drag-overlay"><Upload size={22} /><span>Drop DDRs / WCRs to ingest (multi)</span></div>}<div className="status-footer"><span><i className="online-dot" /> {processing ? status : document ? 'INDEXED FROM UPLOADED DOCUMENT' : 'AWAITING UPLOAD'}</span><span><FileText size={12} /> {document?.name || 'No document indexed'}</span><span>{document ? `${document.report.sections.length} sections · ${document.report.events.length} events · ${document.embeddings.length} vectors` : 'No operational data loaded'}</span><CircleHelp size={13} /></div></div>
 }
