@@ -1,0 +1,17 @@
+{
+  "detector": {
+    "ignoreRules": [],
+    "ignoreFiles": [],
+    "ignoreValues": [
+      {
+        "rule": "codex-grid-background",
+        "value": "*",
+        "files": [
+          "src/styles.css"
+        ],
+        "createdAt": "2026-09-02T16:02:52.280Z",
+        "reason": "intentional cartographic coordinate grid on the nearby-wells map surface"
+      }
+    ]
+  }
+}
