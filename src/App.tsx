@@ -11,7 +11,7 @@ import { createWorker } from 'tesseract.js'
 // Vite serves workers as ESM – wire maplibre's worker to avoid
 // "blocked because of a disallowed MIME type" in dev (localhost:5173)
 setWorkerUrl(maplibreWorkerUrl)
-import { Activity, AlertTriangle, ArrowUpRight, Bell, BrainCircuit, ChevronDown, CircleHelp, Crosshair, Database, FileScan, FileText, MapPinned, Menu, Network, PanelLeftClose, Search, Send, Settings2, Sparkles, Upload, X, Zap } from 'lucide-react'
+import { Activity, AlertTriangle, ArrowUpRight, Bell, BrainCircuit, ChevronDown, CircleHelp, Crosshair, Database, FileScan, FileText, MapPinned, Maximize2, Menu, Network, PanelLeftClose, Search, Send, Settings2, Sparkles, Upload, X, Zap } from 'lucide-react'
 
 GlobalWorkerOptions.workerSrc = pdfWorkerUrl
 
@@ -33,7 +33,19 @@ type Analysis = { report: Report; segments: Segment[]; embeddings: Embedding[]; 
 type IndexedDocument = Analysis & { name: string; url: string; pages: number }
 type WordBox = { text: string; page: number; x: number; y: number; w: number; h: number }
 
-const mapStyle: StyleSpecification = { version: 8, sources: {}, layers: [{ id: 'background', type: 'background', paint: { 'background-color': '#edf7f5' } }] }
+const mapStyle: StyleSpecification = {
+  version: 8, sources: {
+    'indian-basemap': {
+      type: 'raster',
+      tiles: ['https://server.arcgisonline.com/ArcGIS/rest/services/World_Imagery/MapServer/tile/{z}/{y}/{x}'],
+      tileSize: 256, maxzoom: 19, attribution: '© Esri — Source India data: Survey of India, NRSC',
+    },
+  },
+  layers: [
+    { id: 'background', type: 'background', paint: { 'background-color': '#edf7f5' } },
+    { id: 'indian-basemap', type: 'raster', source: 'indian-basemap', paint: { 'raster-opacity': 0.85 } },
+  ],
+}
 const value = (input: string | number | null | undefined, suffix = '') => input === null || input === undefined || input === '' ? 'Not found' : `${typeof input === 'number' ? input.toLocaleString() : input}${suffix}`
 const isImageFile = (file: File) => file.type.startsWith('image/') || /\.(png|jpe?g|tiff|bmp|webp)$/i.test(file.name)
 
@@ -118,7 +130,7 @@ async function analyseDocument(file: File, onProgress: (progress: number, messag
   return analysePdf(file, onProgress)
 }
 
-function FieldMap({ report }: { report: Report }) {
+function FieldMap({ report, fullscreen }: { report: Report; fullscreen?: boolean }) {
   const containerRef = useRef<HTMLDivElement>(null)
   const mapRef = useRef<MapLibreMap | null>(null)
   const validOffsets = useMemo(() => report.offset_wells.filter((well) => Number.isFinite(well.latitude) && Number.isFinite(well.longitude)), [report.offset_wells])
@@ -129,13 +141,11 @@ function FieldMap({ report }: { report: Report }) {
     if (!hasCoords || !center || !containerRef.current) return
     const features: FeatureCollection<Point> = { type: 'FeatureCollection', features: [{ type: 'Feature', properties: { id: report.well_name || 'Active well', state: 'active', depth: report.current_md }, geometry: { type: 'Point', coordinates: center } }, ...validOffsets.map((well) => ({ type: 'Feature' as const, properties: { id: well.id, state: 'offset', depth: well.depth }, geometry: { type: 'Point' as const, coordinates: [well.longitude as number, well.latitude as number] } }))] }
     if (mapRef.current) { mapRef.current.remove(); mapRef.current = null }
-    const map = new MapLibreMap({ container: containerRef.current, style: mapStyle, center, zoom: 10, attributionControl: false })
+    const map = new MapLibreMap({ container: containerRef.current, style: mapStyle, center, zoom: 10, minZoom: 4, maxZoom: 15, attributionControl: false, renderWorldCopies: false })
     mapRef.current = map
     map.addControl(new NavigationControl({ showCompass: true }), 'top-right')
     const setupLayers = () => {
-      if (map.getSource('osm')) return
-      try { map.addSource('osm', { type: 'raster', tiles: ['https://tile.openstreetmap.org/{z}/{x}/{y}.png'], tileSize: 256, maxzoom: 19, attribution: '© OpenStreetMap contributors' }) } catch { /* ignore if already added */ }
-      if (!map.getLayer('osm')) { try { map.addLayer({ id: 'osm', type: 'raster', source: 'osm', paint: { 'raster-opacity': .48, 'raster-saturation': -.55 } }) } catch { /* */ } }
+      if (map.getSource('document-wells')) return
       if (!map.getSource('document-wells')) map.addSource('document-wells', { type: 'geojson', data: features })
       else (map.getSource('document-wells') as unknown as { setData: (d: unknown) => void }).setData(features)
       if (!map.getLayer('well-points')) {
@@ -170,7 +180,7 @@ function FieldMap({ report }: { report: Report }) {
   }, [hasCoords, center, report.well_name, report.current_md, validOffsets])
 
   if (!hasCoords || !center) return <div className="map-missing"><MapPinned size={26} /><b>No document coordinates found</b><span>The map will populate only when latitude and longitude are present in the uploaded document.</span></div>
-  return <div className="real-map-wrap"><div ref={containerRef} className="real-map" style={{ width: '100%', height: '100%' }} /><div className="map-overlay-title">DOCUMENT LOCATIONS <span>• {1 + validOffsets.length} WELLS</span></div><aside className="map-ddr-preview"><b><FileText size={12} /> INDEXED LOCATION</b><span>{report.well_name || 'Well name not found'}</span><small>{report.latitude!.toFixed(6)}, {report.longitude!.toFixed(6)}</small><strong>{value(report.current_md, ' m')} · {report.formation || 'Formation not found'}</strong></aside></div>
+  return <div className={`real-map-wrap ${fullscreen ? 'fullscreen' : ''}`}><div ref={containerRef} className="real-map" style={{ width: '100%', height: '100%' }} /><div className="map-overlay-title">DOCUMENT LOCATIONS <span>• {1 + validOffsets.length} WELLS</span></div><aside className="map-ddr-preview"><b><FileText size={12} /> INDEXED LOCATION</b><span>{report.well_name || 'Well name not found'}</span><small>{report.latitude!.toFixed(6)}, {report.longitude!.toFixed(6)}</small><strong>{value(report.current_md, ' m')} · {report.formation || 'Formation not found'}</strong></aside></div>
 }
 
 function PdfViewer({ document }: { document: IndexedDocument }) {
@@ -216,9 +226,11 @@ function PredictionPanel({ document, question, setQuestion }: { document: Indexe
 }
 
 export default function App() {
-  const [view, setView] = useState<View>('command'); const [sidebarOpen, setSidebarOpen] = useState(true); const [document, setDocument] = useState<IndexedDocument | null>(null); const [processing, setProcessing] = useState(false); const [progress, setProgress] = useState(0); const [status, setStatus] = useState('No document indexed'); const [error, setError] = useState(''); const [question, setQuestion] = useState(''); const [dragOver, setDragOver] = useState(false)
+  const [view, setView] = useState<View>('command'); const [sidebarOpen, setSidebarOpen] = useState(true); const [document, setDocument] = useState<IndexedDocument | null>(null); const [processing, setProcessing] = useState(false); const [progress, setProgress] = useState(0); const [status, setStatus] = useState('No document indexed'); const [error, setError] = useState(''); const [question, setQuestion] = useState(''); const [dragOver, setDragOver] = useState(false); const [fullscreen, setFullscreen] = useState(false)
   const documentUrlRef = useRef<string | null>(null)
   useEffect(() => () => { if (documentUrlRef.current) URL.revokeObjectURL(documentUrlRef.current) }, [])
+  function toggleFullscreen() { if (!window.document.fullscreenElement) { window.document.documentElement.requestFullscreen?.() } else { window.document.exitFullscreen?.() }; setFullscreen((v) => !v) }
+  useEffect(() => { function handleFullscreenChange() { setFullscreen(!!window.document.fullscreenElement) }; window.document.addEventListener('fullscreenchange', handleFullscreenChange); return () => window.document.removeEventListener('fullscreenchange', handleFullscreenChange) }, [])
   async function ingestFile(file: File) {
     if (documentUrlRef.current) { URL.revokeObjectURL(documentUrlRef.current); documentUrlRef.current = null }
     setProcessing(true); setProgress(1); setError(''); setStatus(`Opening ${file.name}`); setView('documents')
@@ -237,7 +249,7 @@ export default function App() {
     if (view === 'documents') return <div className="view-grid documents-view"><div className="panel document-panel"><DocumentPanel document={document} processing={processing} progress={progress} status={status} /></div><div className="panel activity-panel"><StreamPanel document={document} status={status} /></div></div>
     if (view === 'embeddings') return <div className="view-grid embeddings-view"><div className="panel embeddings-panel"><EmbeddingPanel embeddings={document.embeddings} model={document.embeddingModel} /></div><div className="panel panel-copy"><PanelHeader icon={<MapPinned size={16} />} title="DOCUMENT WELL CONTEXT" meta={`${report.offset_wells.length} OFFSET REFERENCES`} /><h2>{report.well_name || 'Well name not found'}</h2><p>{report.lease_block || 'No lease or block was found in the document.'}</p><div className="linked-well-list">{report.offset_wells.length ? report.offset_wells.map((well) => <button key={well.id}><span>{well.id}</span><small>{value(well.depth, ' m')} · {value(well.distance_km, ' km')}</small><ArrowUpRight size={14} /></button>) : <p>No offset wells were explicitly identified.</p>}</div></div></div>
     if (view === 'prediction') return <div className="view-grid prediction-view"><div className="panel prediction-panel large"><PredictionPanel document={document} question={question} setQuestion={setQuestion} /></div><div className="panel panel-copy"><PanelHeader icon={<Bell size={16} />} title="EXTRACTED EVENTS" meta={`${report.events.length} FOUND`} /><div className="alert-log">{report.events.length ? report.events.map((event, index) => <span key={`${event.type}-${index}`}><b>{event.time || '—'}</b>{event.type}{event.depth === null ? '' : ` · ${event.depth.toLocaleString()} m`}</span>) : <span>No operational events found.</span>}</div></div></div>
-    return <><div className="hero-grid"><div className="panel map-panel"><PanelHeader icon={<MapPinned size={16} />} title="DOCUMENT WELL LOCATIONS" meta={report.latitude === null || report.longitude === null ? 'COORDINATES NOT FOUND' : `${1 + report.offset_wells.filter((well) => well.latitude !== null && well.longitude !== null).length} MAPPED`} /><FieldMap report={report} /></div><div className="panel depth-panel"><DepthPanel report={report} /></div><div className="panel document-panel"><DocumentPanel document={document} processing={processing} progress={progress} status={status} /></div></div><RiskRow risks={report.risks || []} events={report.events || []} openPrediction={() => setView('prediction')} /><div className="lower-grid"><div className="panel activity-panel"><StreamPanel document={document} status={status} /></div><div className="panel prediction-panel"><PredictionPanel document={document} question={question} setQuestion={setQuestion} /></div></div></>
+    return <><div className="hero-grid"><div className={`panel map-panel ${fullscreen ? 'map-panel-fullscreen' : ''}`}><PanelHeader icon={<MapPinned size={16} />} title="DOCUMENT WELL LOCATIONS" meta={report.latitude === null || report.longitude === null ? 'COORDINATES NOT FOUND' : `${1 + report.offset_wells.filter((well) => well.latitude !== null && well.longitude !== null).length} MAPPED`} /><div className="map-toolbar"><span style={{ flex: 1 }} /><button className="icon-button" aria-label="Toggle fullscreen" onClick={toggleFullscreen}>{fullscreen ? <X size={15} /> : <Maximize2 size={15} />}</button></div><FieldMap report={report} fullscreen={fullscreen} /></div><div className="panel depth-panel"><DepthPanel report={report} /></div><div className="panel document-panel"><DocumentPanel document={document} processing={processing} progress={progress} status={status} /></div></div><RiskRow risks={report.risks || []} events={report.events || []} openPrediction={() => setView('prediction')} /><div className="lower-grid"><div className="panel activity-panel"><StreamPanel document={document} status={status} /></div><div className="panel prediction-panel"><PredictionPanel document={document} question={question} setQuestion={setQuestion} /></div></div></>
   }
   const heading = view === 'command' ? 'Operational evidence from uploaded documents.' : view === 'documents' ? 'Make every report searchable.' : view === 'embeddings' ? 'Explore this document’s evidence.' : 'Ask against indexed evidence.'
   function onDragOver(event: React.DragEvent) { event.preventDefault(); if (!dragOver) setDragOver(true) }
