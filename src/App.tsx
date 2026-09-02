@@ -1,144 +1,247 @@
 import { useEffect, useMemo, useRef, useState } from 'react'
 import type { ChangeEvent, FormEvent, ReactNode } from 'react'
-import { Map as MapLibreMap, NavigationControl, Popup, type GeoJSONSource, type StyleSpecification } from 'maplibre-gl'
-import type { Feature, FeatureCollection, LineString, Point, Polygon } from 'geojson'
+import { Map as MapLibreMap, NavigationControl, Popup, setWorkerUrl, type StyleSpecification } from 'maplibre-gl'
+import maplibreWorkerUrl from 'maplibre-gl/dist/maplibre-gl-worker.mjs?url'
+import type { FeatureCollection, Point } from 'geojson'
 import 'maplibre-gl/dist/maplibre-gl.css'
 import { getDocument, GlobalWorkerOptions } from 'pdfjs-dist'
 import pdfWorkerUrl from 'pdfjs-dist/build/pdf.worker.min.mjs?url'
 import { createWorker } from 'tesseract.js'
-import { Activity, AlertTriangle, ArrowDownRight, ArrowUpRight, Bell, BrainCircuit, ChevronDown, CircleHelp, Crosshair, Database, FileScan, FileText, Gauge, Layers3, MapPinned, Menu, Network, PanelLeftClose, Search, Send, Settings2, Sparkles, Target, Upload, X, Zap } from 'lucide-react'
 
-type View = 'command' | 'documents' | 'embeddings' | 'prediction'
-type Tone = 'critical' | 'warning' | 'stable'
-type Well = { id: string; x: number; y: number; depth: string; distance: string; state: 'active' | 'offset'; risk?: Tone }
-type Block = { id: string; label: string; x: number; y: number; w: number; h: number; tone: 'cyan' | 'amber' | 'coral' }
+// Vite serves workers as ESM – wire maplibre's worker to avoid
+// "blocked because of a disallowed MIME type" in dev (localhost:5173)
+setWorkerUrl(maplibreWorkerUrl)
+import { Activity, AlertTriangle, ArrowUpRight, Bell, BrainCircuit, ChevronDown, CircleHelp, Crosshair, Database, FileScan, FileText, MapPinned, Menu, Network, PanelLeftClose, Search, Send, Settings2, Sparkles, Upload, X, Zap } from 'lucide-react'
 
 GlobalWorkerOptions.workerSrc = pdfWorkerUrl
-let activePreviewUrl = '/NWIS_DDR_A17_DEMO.pdf'
 
-const ddrRecord = {
-  wellName: 'A-17 / Barail North', reportNo: 'Day 14', latitude: 26.123456, longitude: 97.654321,
-  currentMd: 2853, currentTvd: 2418, formation: 'Barail - Upper sandstone', mudWeight: '1.35 SG',
-  events: [
-    { time: '19:48', title: 'Partial returns', depth: 2805, severity: 'High', detail: 'Reduce ECD; maintain circulation.' },
-    { time: '20:20', title: 'High flow deviation', depth: 2818, severity: 'Medium', detail: 'Flow check against A-08 behaviour.' },
-    { time: '17:35', title: 'NPT - hydraulic leak', depth: 2831, severity: 'Low', detail: 'Repair iron roughneck; record 2.5 h NPT.' },
-  ],
-  offsets: [{ id: 'A-08', separation: '0.9 km', note: 'Loss correlation' }, { id: 'A-12', separation: '1.8 km', note: 'Pressure correlation' }, { id: 'A-21', separation: '2.6 km', note: 'Directional context' }],
+type View = 'command' | 'documents' | 'embeddings' | 'prediction'
+type Segment = { page: number; x: number; y: number; w: number; h: number; label: string; tone: 'cyan' | 'amber' | 'coral' }
+type Embedding = { id: string; label: string; excerpt: string; x: number; y: number }
+type Event = { time: string | null; type: string; depth: number | null; severity: 'high' | 'medium' | 'low' | null; mitigation: string | null; evidence: string }
+type Risk = { label: string; probability: number | null; trend: 'rising' | 'steady' | 'falling' | null; evidence: string }
+type OffsetWell = { id: string; latitude: number | null; longitude: number | null; depth: number | null; distance_km: number | null; relationship: string | null }
+type Formation = { name: string; top_md: number | null; bottom_md: number | null }
+type Section = { label: string; anchor: string; summary: string; evidence?: string }
+type Report = {
+  well_name: string | null; report_date: string | null; report_number: string | null; latitude: number | null; longitude: number | null;
+  current_md: number | null; current_tvd: number | null; formation: string | null; mud_weight: string | null; operator: string | null;
+  rig_name: string | null; lease_block: string | null; progress: number | null; avg_rop: number | null; formations: Formation[];
+  events: Event[]; risks: Risk[]; offset_wells: OffsetWell[]; sections: Section[];
+}
+type Analysis = { report: Report; segments: Segment[]; embeddings: Embedding[]; embeddingModel: string; corpus: string }
+type IndexedDocument = Analysis & { name: string; url: string; pages: number }
+type WordBox = { text: string; page: number; x: number; y: number; w: number; h: number }
+
+const mapStyle: StyleSpecification = { version: 8, sources: {}, layers: [{ id: 'background', type: 'background', paint: { 'background-color': '#edf7f5' } }] }
+const value = (input: string | number | null | undefined, suffix = '') => input === null || input === undefined || input === '' ? 'Not found' : `${typeof input === 'number' ? input.toLocaleString() : input}${suffix}`
+const isImageFile = (file: File) => file.type.startsWith('image/') || /\.(png|jpe?g|tiff|bmp|webp)$/i.test(file.name)
+
+async function analyseImage(file: File, onProgress: (progress: number, message: string) => void): Promise<{ analysis: Analysis; pages: number }> {
+  onProgress(25, 'Running OCR on image document')
+  const worker = await createWorker('eng')
+  const imageUrl = URL.createObjectURL(file)
+  try {
+    const img = await new Promise<HTMLImageElement>((resolve, reject) => {
+      const image = new Image()
+      image.onload = () => resolve(image)
+      image.onerror = () => reject(new Error('Failed to load image for OCR.'))
+      image.src = imageUrl
+    })
+    const canvas = window.document.createElement('canvas')
+    canvas.width = img.naturalWidth
+    canvas.height = img.naturalHeight
+    const context = canvas.getContext('2d')
+    if (!context) throw new Error('Canvas not available for image OCR.')
+    context.drawImage(img, 0, 0)
+    const result = await worker.recognize(canvas)
+    const data = result.data as unknown as { text: string; words?: Array<{ text: string; bbox: { x0: number; y0: number; x1: number; y1: number } }> }
+    const text = `\n\n[PAGE 1]\n${String(data.text || '').trim()}`
+    const words: WordBox[] = (data.words || []).map((word) => ({ text: word.text, page: 1, x: word.bbox.x0 / canvas.width * 100, y: word.bbox.y0 / canvas.height * 100, w: (word.bbox.x1 - word.bbox.x0) / canvas.width * 100, h: (word.bbox.y1 - word.bbox.y0) / canvas.height * 100 }))
+    if (!text.replace(/\[PAGE \d+\]/g, '').trim()) throw new Error('No readable text was found in this image.')
+    onProgress(72, 'Sending OCR evidence to Groq for factual structuring')
+    const response = await fetch('/api/structure-ddr', { method: 'POST', headers: { 'content-type': 'application/json' }, body: JSON.stringify({ text, words }) })
+    const payload = await response.json()
+    if (!response.ok) throw new Error(payload.error || 'Document analysis failed.')
+    onProgress(100, `Indexed ${payload.report.sections?.length || 0} sections from 1 page`)
+    return { analysis: payload as Analysis, pages: 1 }
+  } finally {
+    URL.revokeObjectURL(imageUrl)
+    await worker.terminate()
+  }
 }
 
-const wells: Well[] = [
-  { id: 'A-17', x: 50, y: 57, depth: `${ddrRecord.currentMd.toLocaleString()} m`, distance: '0 km', state: 'active' },
-  { id: 'A-12', x: 59, y: 16, depth: '2,311 m', distance: '4.8 km', state: 'offset', risk: 'stable' },
-  { id: 'A-21', x: 78, y: 29, depth: '2,902 m', distance: '5.6 km', state: 'offset', risk: 'warning' },
-  { id: 'A-08', x: 28, y: 34, depth: '2,626 m', distance: '3.9 km', state: 'offset', risk: 'critical' },
-  { id: 'A-03', x: 17, y: 53, depth: '2,150 m', distance: '6.2 km', state: 'offset', risk: 'stable' },
-  { id: 'A-19', x: 84, y: 52, depth: '2,734 m', distance: '4.1 km', state: 'offset', risk: 'warning' },
-  { id: 'A-15', x: 79, y: 75, depth: '2,601 m', distance: '5.0 km', state: 'offset', risk: 'critical' },
-  { id: 'A-07', x: 43, y: 88, depth: '2,205 m', distance: '3.6 km', state: 'offset', risk: 'stable' },
-  { id: 'A-10', x: 22, y: 78, depth: '2,478 m', distance: '4.4 km', state: 'offset', risk: 'warning' },
-]
-const blocks: Block[] = [
-  { id: 'b1', label: 'TITLE', x: 9, y: 7, w: 39, h: 10, tone: 'cyan' }, { id: 'b2', label: 'WELL / DATE', x: 55, y: 7, w: 35, h: 12, tone: 'amber' },
-  { id: 'b3', label: 'OPS SUMMARY', x: 7, y: 23, w: 53, h: 18, tone: 'cyan' }, { id: 'b4', label: 'METRICS TABLE', x: 63, y: 24, w: 29, h: 24, tone: 'amber' },
-  { id: 'b5', label: 'LITHOLOGY', x: 7, y: 45, w: 54, h: 18, tone: 'cyan' }, { id: 'b6', label: 'DRILLING NOTE', x: 7, y: 67, w: 85, h: 17, tone: 'amber' },
-]
-const embeddingPoints = [[15, 67, 'cyan'], [20, 58, 'cyan'], [24, 74, 'cyan'], [28, 62, 'cyan'], [31, 80, 'cyan'], [42, 32, 'amber'], [47, 38, 'amber'], [52, 28, 'amber'], [55, 43, 'amber'], [60, 35, 'amber'], [74, 64, 'coral'], [79, 55, 'coral'], [84, 72, 'coral'], [89, 61, 'coral'], [83, 82, 'coral'], [65, 16, 'slate'], [71, 23, 'slate'], [77, 14, 'slate'], [69, 31, 'slate']] as const
-const center: [number, number] = [ddrRecord.longitude, ddrRecord.latitude]
-const mapStyle: StyleSpecification = { version: 8, sources: {}, layers: [{ id: 'background', type: 'background', paint: { 'background-color': '#edf7f5' } }] }
-function circlePolygon(radiusKm: number) { const pts: [number, number][] = []; for (let i = 0; i <= 64; i += 1) { const a = (i / 64) * Math.PI * 2; pts.push([center[0] + (radiusKm / 98) * Math.cos(a), center[1] + (radiusKm / 111) * Math.sin(a)]) } return { type: 'Feature', properties: {}, geometry: { type: 'Polygon', coordinates: [pts] } } as Feature<Polygon> }
-function geojsonWells(visible: Well[]) { return { type: 'FeatureCollection', features: visible.map((well) => ({ type: 'Feature', properties: { id: well.id, depth: well.depth, state: well.state }, geometry: { type: 'Point', coordinates: [center[0] + (well.x - 50) / 50, center[1] + (50 - well.y) / 50] } })) } as FeatureCollection<Point> }
-function geojsonTrajectories(visible: Well[]) { return { type: 'FeatureCollection', features: visible.filter((w) => w.id !== 'A-17').map((w) => ({ type: 'Feature', properties: {}, geometry: { type: 'LineString', coordinates: [center, [center[0] + (w.x - 50) / 75, center[1] + (50 - w.y) / 75], [center[0] + (w.x - 50) / 50, center[1] + (50 - w.y) / 50]] } })) } as FeatureCollection<LineString> }
-
-async function parseDdrPdf(file: File, onProgress: (value: number) => void) {
-  const document = await getDocument({ data: await file.arrayBuffer() }).promise
-  let extractedText = ''
-  for (let pageNumber = 1; pageNumber <= document.numPages; pageNumber += 1) {
-    const page = await document.getPage(pageNumber)
+async function analysePdf(file: File, onProgress: (progress: number, message: string) => void) {
+  const pdf = await getDocument({ data: await file.arrayBuffer() }).promise
+  let text = ''
+  const words: WordBox[] = []
+  for (let pageNumber = 1; pageNumber <= pdf.numPages; pageNumber += 1) {
+    const page = await pdf.getPage(pageNumber)
+    const viewport = page.getViewport({ scale: 1 })
     const content = await page.getTextContent()
-    const pageText = content.items.map((item) => ('str' in item ? item.str : '')).join(' ')
-    extractedText += ` ${pageText}`
-    onProgress(Math.round((pageNumber / document.numPages) * 55))
+    let pageText = ''
+    for (const item of content.items) {
+      if (!('str' in item) || !item.str.trim()) continue
+      const [,,, height, x, y] = item.transform
+      pageText += ` ${item.str}`
+      words.push({ text: item.str, page: pageNumber, x: x / viewport.width * 100, y: (viewport.height - y - Math.abs(height)) / viewport.height * 100, w: item.width / viewport.width * 100, h: Math.max(1, Math.abs(height) / viewport.height * 100) })
+    }
     if (pageText.trim().length < 80) {
-      const viewport = page.getViewport({ scale: 1.7 })
-      const canvas = window.document.createElement('canvas')
-      canvas.width = viewport.width; canvas.height = viewport.height
+      onProgress(Math.round(pageNumber / pdf.numPages * 55), `Running OCR on scanned page ${pageNumber} of ${pdf.numPages}`)
+      const ocrViewport = page.getViewport({ scale: 1.8 })
+      const canvas = window.document.createElement('canvas'); canvas.width = ocrViewport.width; canvas.height = ocrViewport.height
       const context = canvas.getContext('2d')
       if (context) {
-        await page.render({ canvas, canvasContext: context, viewport }).promise
+        await page.render({ canvas, canvasContext: context, viewport: ocrViewport }).promise
         const worker = await createWorker('eng')
         const result = await worker.recognize(canvas)
-        extractedText += ` ${result.data.text}`
+        const data = result.data as unknown as { text: string; words?: Array<{ text: string; bbox: { x0: number; y0: number; x1: number; y1: number } }> }
+        pageText = data.text
+        for (const word of data.words || []) words.push({ text: word.text, page: pageNumber, x: word.bbox.x0 / canvas.width * 100, y: word.bbox.y0 / canvas.height * 100, w: (word.bbox.x1 - word.bbox.x0) / canvas.width * 100, h: (word.bbox.y1 - word.bbox.y0) / canvas.height * 100 })
         await worker.terminate()
       }
     }
+    text += `\n\n[PAGE ${pageNumber}]\n${pageText.trim()}`
+    onProgress(Math.round(pageNumber / pdf.numPages * 65), `Extracted page ${pageNumber} of ${pdf.numPages}`)
   }
-  const md = extractedText.match(/Current\s+MD\s*(?:\(m\)|\(ft\))?\s*[:]?\s*([\d,]+)/i)
-  const lat = extractedText.match(/Latitude\s*:\s*([\d.]+)/i)
-  const lon = extractedText.match(/Longitude\s*:\s*([\d.]+)/i)
-  const structured = await fetch('http://localhost:8787/api/structure-ddr', { method: 'POST', headers: { 'content-type': 'application/json' }, body: JSON.stringify({ text: extractedText }) }).then((response) => response.ok ? response.json() : null).catch(() => null)
-  return { pages: document.numPages, text: extractedText, md: md ? Number(md[1].replace(/,/g, '')) : ddrRecord.currentMd, lat: lat?.[1], lon: lon?.[1], structured }
+  if (!text.replace(/\[PAGE \d+\]/g, '').trim()) throw new Error('No readable text was found in this document.')
+  onProgress(72, 'Sending OCR evidence to Groq for factual structuring')
+  const response = await fetch('/api/structure-ddr', { method: 'POST', headers: { 'content-type': 'application/json' }, body: JSON.stringify({ text, words }) })
+  const payload = await response.json()
+  if (!response.ok) throw new Error(payload.error || 'Document analysis failed.')
+  onProgress(100, `Indexed ${payload.report.sections?.length || 0} sections from ${pdf.numPages} pages`)
+  return { analysis: payload as Analysis, pages: pdf.numPages }
 }
 
-function RealMap({ radius, onSelect }: { radius: number; onSelect: (id: string) => void }) {
-  const containerRef = useRef<HTMLDivElement>(null); const mapRef = useRef<MapLibreMap | null>(null)
-  const visible = useMemo(() => wells.filter((well) => well.state === 'active' || Number.parseFloat(well.distance) <= radius), [radius])
+async function analyseDocument(file: File, onProgress: (progress: number, message: string) => void) {
+  if (isImageFile(file)) return analyseImage(file, onProgress)
+  return analysePdf(file, onProgress)
+}
+
+function FieldMap({ report }: { report: Report }) {
+  const containerRef = useRef<HTMLDivElement>(null)
+  const mapRef = useRef<MapLibreMap | null>(null)
+  const validOffsets = useMemo(() => report.offset_wells.filter((well) => Number.isFinite(well.latitude) && Number.isFinite(well.longitude)), [report.offset_wells])
+  const hasCoords = report.latitude !== null && report.longitude !== null && Number.isFinite(report.latitude) && Number.isFinite(report.longitude)
+  const center = useMemo<[number, number] | null>(() => hasCoords ? [report.longitude as number, report.latitude as number] : null, [hasCoords, report.longitude, report.latitude])
+
   useEffect(() => {
-    if (!containerRef.current || mapRef.current) return
-    const map = new MapLibreMap({ container: containerRef.current, style: mapStyle, center, zoom: 9.3, attributionControl: false }); map.addControl(new NavigationControl({ showCompass: true }), 'top-right')
-    map.on('load', () => {
-      map.addSource('osm', { type: 'raster', tiles: ['https://tile.openstreetmap.org/{z}/{x}/{y}.png'], tileSize: 256, maxzoom: 19, attribution: '© OpenStreetMap contributors' })
-      map.addLayer({ id: 'osm-base', type: 'raster', source: 'osm', paint: { 'raster-opacity': .34, 'raster-saturation': -.65, 'raster-contrast': -.08 } })
-      map.addSource('radius', { type: 'geojson', data: circlePolygon(radius) }); map.addLayer({ id: 'radius-fill', type: 'fill', source: 'radius', paint: { 'fill-color': '#e86b4d', 'fill-opacity': .06 } }); map.addLayer({ id: 'radius-line', type: 'line', source: 'radius', paint: { 'line-color': '#e86b4d', 'line-width': 1, 'line-dasharray': [2, 2] } })
-      map.addSource('trajectories', { type: 'geojson', data: geojsonTrajectories(visible) }); map.addLayer({ id: 'trajectories-line', type: 'line', source: 'trajectories', paint: { 'line-color': '#74bdb7', 'line-width': 2, 'line-opacity': .7 } })
-      map.addSource('wells', { type: 'geojson', data: geojsonWells(visible) }); map.addLayer({ id: 'well-points', type: 'circle', source: 'wells', paint: { 'circle-radius': ['case', ['==', ['get', 'state'], 'active'], 9, 5], 'circle-color': ['case', ['==', ['get', 'state'], 'active'], '#e86b4d', '#55b8b2'], 'circle-stroke-color': '#fff', 'circle-stroke-width': 2 } }); map.addLayer({ id: 'well-labels', type: 'symbol', source: 'wells', layout: { 'text-field': ['get', 'id'], 'text-offset': [0, 1.2], 'text-size': 11 }, paint: { 'text-color': '#355a57', 'text-halo-color': '#edf7f5', 'text-halo-width': 1.2 } })
-      map.on('click', 'well-points', (event) => { const feature = event.features?.[0]; const id = feature?.properties?.id; if (!id) return; onSelect(id); const point = feature.geometry as Point; new Popup({ closeButton: false, offset: 10 }).setLngLat(point.coordinates as [number, number]).setHTML(`<strong>${id}</strong><br/><span>${feature.properties?.depth}</span>`).addTo(map) }); map.on('mouseenter', 'well-points', () => { map.getCanvas().style.cursor = 'pointer' }); map.on('mouseleave', 'well-points', () => { map.getCanvas().style.cursor = '' })
-    }); const resizeObserver = new ResizeObserver(() => map.resize()); resizeObserver.observe(containerRef.current); requestAnimationFrame(() => map.resize()); mapRef.current = map; return () => { resizeObserver.disconnect(); map.remove(); mapRef.current = null }
-  }, [])
-  useEffect(() => { const map = mapRef.current; if (!map || !map.isStyleLoaded()) return; (map.getSource('radius') as GeoJSONSource | undefined)?.setData(circlePolygon(radius)); (map.getSource('wells') as GeoJSONSource | undefined)?.setData(geojsonWells(visible)); (map.getSource('trajectories') as GeoJSONSource | undefined)?.setData(geojsonTrajectories(visible)) }, [radius, visible])
-  return <div className="real-map-wrap"><div ref={containerRef} className="real-map" /><div className="map-overlay-title">LIVE FIELD MAP <span>• {visible.length} WELLS</span></div><aside className="map-ddr-preview"><b><FileText size={12} /> DDR LIVE INGEST</b><span>{ddrRecord.wellName}</span><small>{ddrRecord.latitude.toFixed(6)} N · {ddrRecord.longitude.toFixed(6)} E</small><strong>{ddrRecord.currentMd.toLocaleString()} m · {ddrRecord.formation}</strong><em>⚠ {ddrRecord.events[0].title} @ {ddrRecord.events[0].depth.toLocaleString()} m</em></aside><div className="map-legend compact"><span><i className="legend-dot cyan" />ACTIVE WELL</span><span><i className="legend-dot hollow" />OFFSET WELL</span><span><i className="legend-dash" />RADIUS ZONE</span></div></div>
+    if (!hasCoords || !center || !containerRef.current) return
+    const features: FeatureCollection<Point> = { type: 'FeatureCollection', features: [{ type: 'Feature', properties: { id: report.well_name || 'Active well', state: 'active', depth: report.current_md }, geometry: { type: 'Point', coordinates: center } }, ...validOffsets.map((well) => ({ type: 'Feature' as const, properties: { id: well.id, state: 'offset', depth: well.depth }, geometry: { type: 'Point' as const, coordinates: [well.longitude as number, well.latitude as number] } }))] }
+    if (mapRef.current) { mapRef.current.remove(); mapRef.current = null }
+    const map = new MapLibreMap({ container: containerRef.current, style: mapStyle, center, zoom: 10, attributionControl: false })
+    mapRef.current = map
+    map.addControl(new NavigationControl({ showCompass: true }), 'top-right')
+    const setupLayers = () => {
+      if (map.getSource('osm')) return
+      try { map.addSource('osm', { type: 'raster', tiles: ['https://tile.openstreetmap.org/{z}/{x}/{y}.png'], tileSize: 256, maxzoom: 19, attribution: '© OpenStreetMap contributors' }) } catch { /* ignore if already added */ }
+      if (!map.getLayer('osm')) { try { map.addLayer({ id: 'osm', type: 'raster', source: 'osm', paint: { 'raster-opacity': .48, 'raster-saturation': -.55 } }) } catch { /* */ } }
+      if (!map.getSource('document-wells')) map.addSource('document-wells', { type: 'geojson', data: features })
+      else (map.getSource('document-wells') as unknown as { setData: (d: unknown) => void }).setData(features)
+      if (!map.getLayer('well-points')) {
+        map.addLayer({ id: 'well-points', type: 'circle', source: 'document-wells', paint: { 'circle-radius': ['case', ['==', ['get', 'state'], 'active'], 11, 7], 'circle-color': ['case', ['==', ['get', 'state'], 'active'], '#e86b4d', '#55b8b2'], 'circle-stroke-color': '#fff', 'circle-stroke-width': 2.5 } })
+        map.addLayer({ id: 'well-labels', type: 'symbol', source: 'document-wells', layout: { 'text-field': ['get', 'id'], 'text-offset': [0, 1.5], 'text-size': 11 }, paint: { 'text-color': '#315653', 'text-halo-color': '#fff', 'text-halo-width': 1.3 } })
+        map.on('click', 'well-points', (event) => { const feature = event.features?.[0]; if (!feature) return; new Popup({ closeButton: false, offset: 14 }).setLngLat((feature.geometry as Point).coordinates as [number, number]).setHTML(`<strong>${feature.properties?.id}</strong><br>${feature.properties?.depth ? `${Number(feature.properties.depth).toLocaleString()} m` : 'Depth not found'}`).addTo(map) })
+      }
+      // Ensure the active well is centered and visible
+      map.jumpTo({ center, zoom: 10 })
+      // Fit offsets if they exist
+      if (validOffsets.length) {
+        const bounds: [[number, number], [number, number]] = [[center[0], center[1]], [center[0], center[1]]]
+        for (const w of validOffsets) { bounds[0][0] = Math.min(bounds[0][0], w.longitude as number); bounds[0][1] = Math.min(bounds[0][1], w.latitude as number); bounds[1][0] = Math.max(bounds[1][0], w.longitude as number); bounds[1][1] = Math.max(bounds[1][1], w.latitude as number) }
+        try { map.fitBounds(bounds, { padding: 48, maxZoom: 10, duration: 0 }) } catch { /* */ }
+      }
+      setTimeout(() => map.resize(), 80)
+    }
+    map.on('load', setupLayers)
+    // If style already loaded (cached), trigger immediately
+    if (map.isStyleLoaded()) setTimeout(setupLayers, 0)
+    map.on('error', () => { /* tiles may be offline – still show point layer */ if (!map.getSource('document-wells')) setupLayers() })
+
+    const el = containerRef.current
+    const observer = new ResizeObserver(() => { map.resize(); if (center) try { map.jumpTo({ center }) } catch { /* */ } })
+    observer.observe(el)
+    const ro = () => map.resize()
+    window.addEventListener('resize', ro)
+    // Force a resize after mount – container starts with 0 size before CSS applies
+    requestAnimationFrame(() => { map.resize(); if (center) map.jumpTo({ center, zoom: 10 }) })
+    setTimeout(() => { map.resize(); if (center) map.jumpTo({ center, zoom: 10 }) }, 250)
+    return () => { window.removeEventListener('resize', ro); observer.disconnect(); map.remove(); if (mapRef.current === map) mapRef.current = null }
+  }, [hasCoords, center, report.well_name, report.current_md, validOffsets])
+
+  if (!hasCoords || !center) return <div className="map-missing"><MapPinned size={26} /><b>No document coordinates found</b><span>The map will populate only when latitude and longitude are present in the uploaded document.</span></div>
+  return <div className="real-map-wrap"><div ref={containerRef} className="real-map" style={{ width: '100%', height: '100%' }} /><div className="map-overlay-title">DOCUMENT LOCATIONS <span>• {1 + validOffsets.length} WELLS</span></div><aside className="map-ddr-preview"><b><FileText size={12} /> INDEXED LOCATION</b><span>{report.well_name || 'Well name not found'}</span><small>{report.latitude!.toFixed(6)}, {report.longitude!.toFixed(6)}</small><strong>{value(report.current_md, ' m')} · {report.formation || 'Formation not found'}</strong></aside></div>
 }
 
-export default function App() {
-  const [view, setView] = useState<View>('command'); const [radius, setRadius] = useState(3); const [selectedWell, setSelectedWell] = useState('A-17'); const [selectedEvent, setSelectedEvent] = useState('Partial returns'); const [progress, setProgress] = useState(100); const [processing, setProcessing] = useState(false); const [telemetry, setTelemetry] = useState(ddrRecord.currentMd); const [question, setQuestion] = useState(''); const [prediction, setPrediction] = useState(false); const [uploadName, setUploadName] = useState('NWIS_DDR_A17_DEMO.pdf'); const [sidebarOpen, setSidebarOpen] = useState(true); const [ocrStatus, setOcrStatus] = useState('Indexed demo DDR · 2 pages · 18 operational entities'); const [parsedPages, setParsedPages] = useState(2); const [previewUrl, setPreviewUrl] = useState('/NWIS_DDR_A17_DEMO.pdf')
-  useEffect(() => { const timer = window.setInterval(() => setTelemetry((value) => value >= 2864 ? 2846 : value + 1), 1800); return () => window.clearInterval(timer) }, [])
-  async function handleUpload(event: ChangeEvent<HTMLInputElement>) { const file = event.target.files?.[0]; if (!file) return; activePreviewUrl = URL.createObjectURL(file); setPreviewUrl(activePreviewUrl); setUploadName(file.name); setProgress(4); setProcessing(true); setOcrStatus('Opening PDF and queuing page 1…'); setView('documents'); try { const parsed = await parseDdrPdf(file, (value) => { setProgress(value); setOcrStatus(`Extracting page content · ${value}%`) }); setParsedPages(parsed.pages); setTelemetry(parsed.md); setOcrStatus(`OCR + PDF text complete · ${parsed.pages} pages · ${Math.min(24, parsed.text.trim().split(/\s+/).length)} entities linked`); setProgress(100) } catch (error) { setOcrStatus(`Parsing failed: ${error instanceof Error ? error.message : 'unsupported document'}`); setProgress(0) } finally { setProcessing(false); event.target.value = '' } }
-  function askPrediction(event: FormEvent) { event.preventDefault(); if (question.trim()) setPrediction(true) }
-  function renderView() {
-    if (view === 'documents') return <div className="view-grid documents-view"><div className="panel document-panel"><DocumentPanel processing={processing} progress={progress} ocrStatus={ocrStatus} parsedPages={parsedPages} /></div><div className="panel activity-panel"><StreamPanel ocrStatus={ocrStatus} /></div></div>
-    if (view === 'embeddings') return <div className="view-grid embeddings-view"><div className="panel embeddings-panel"><EmbeddingPanel selectedEvent={selectedEvent} setSelectedEvent={setSelectedEvent} /></div><div className="panel panel-copy"><PanelHeader icon={<MapPinned size={16} />} title="LINKED WELL CONTEXT" meta="BARAIL / 0–8 KM" /><h2>Evidence clusters become operational context.</h2><p>Select a point to trace its source passage, well, and formation. The same selection is reflected on the field map and depth correlation.</p><div className="linked-well-list">{wells.slice(0, 5).map((well) => <button key={well.id} className={selectedWell === well.id ? 'selected' : ''} onClick={() => setSelectedWell(well.id)}><span>{well.id}</span><small>{well.depth} · {well.distance}</small><ArrowUpRight size={14} /></button>)}</div></div></div>
-    if (view === 'prediction') return <div className="view-grid prediction-view"><div className="panel prediction-panel large"><PredictionPanel prediction={prediction} setPrediction={setPrediction} question={question} setQuestion={setQuestion} askPrediction={askPrediction} /></div><div className="panel panel-copy"><PanelHeader icon={<Bell size={16} />} title="ALERT LOG" meta="LAST 60 MIN" /><div className="alert-log"><span><b>09:41</b> Partial returns @ {telemetry} m</span><span><b>09:35</b> High flow deviation</span><span><b>09:21</b> Barail formation top reached</span></div><button className="coral-action" onClick={() => setView('documents')}>OPEN SUPPORTING DOCUMENTS <ArrowUpRight size={14} /></button></div></div>
-    return <><div className="hero-grid"><div className="panel map-panel"><PanelHeader icon={<MapPinned size={16} />} title="NEARBY WELLS MAP" meta={`${wells.filter((well) => well.state === 'active' || Number.parseFloat(well.distance) <= radius).length} WELLS / ${radius}.0 KM`} /><div className="map-toolbar"><button className="icon-button" aria-label="Center active well"><Crosshair size={15} /></button><button className="icon-button" aria-label="Toggle layers"><Layers3 size={15} /></button><label className="radius-control">RADIUS <input type="range" min="1" max="8" value={radius} onChange={(event) => setRadius(Number(event.target.value))} /><strong>{radius}.0 km</strong></label></div><RealMap radius={radius} onSelect={setSelectedWell} /></div><div className="panel depth-panel"><DepthPanel telemetry={telemetry} /></div><div className="panel document-panel"><DocumentPanel processing={processing} progress={progress} ocrStatus={ocrStatus} parsedPages={parsedPages} /></div></div><RiskRow telemetry={telemetry} setSelectedEvent={setSelectedEvent} setView={setView} /><div className="lower-grid"><div className="panel activity-panel"><StreamPanel ocrStatus={ocrStatus} /></div><div className="panel prediction-panel"><PredictionPanel prediction={prediction} setPrediction={setPrediction} question={question} setQuestion={setQuestion} askPrediction={askPrediction} /></div></div></>
-  }
-  const navItems: [View, ReactNode, string][] = [['command', <Crosshair size={17} />, 'Command Center'], ['documents', <FileScan size={17} />, 'Documents'], ['embeddings', <Network size={17} />, 'Embedding Explorer'], ['prediction', <BrainCircuit size={17} />, 'Prediction Mode']]
-  return <div className={`app-shell ${sidebarOpen ? '' : 'sidebar-collapsed'}`}><header className="topbar"><button className="sidebar-toggle" onClick={() => setSidebarOpen((open) => !open)} aria-label={sidebarOpen ? 'Collapse navigation' : 'Open navigation'}>{sidebarOpen ? <PanelLeftClose size={18} /> : <Menu size={18} />}</button><div className="brand-lockup"><div className="brand-mark">N°</div><div><div className="brand-title">NWIS</div><div className="brand-subtitle">NEARBY WELLS INTELLIGENCE</div></div></div><div className="top-search"><Search size={15} /><span>Search wells, events, formations…</span></div><div className="top-actions"><span className="online-pill"><i /> PIPELINE ONLINE</span><button aria-label="Notifications"><Bell size={17} /></button><button aria-label="Settings"><Settings2 size={17} /></button></div></header><div className="app-layout"><aside className="sidebar"><div className="sidebar-top"><span>WORKSPACE</span><button onClick={() => setSidebarOpen(false)} aria-label="Collapse sidebar"><PanelLeftClose size={15} /></button></div><nav>{navItems.map(([id, icon, label]) => <button key={id} className={view === id ? 'active' : ''} onClick={() => setView(id)}>{icon}<span>{label}</span>{id === 'prediction' && <i className="nav-alert" />}</button>)}</nav><div className="sidebar-section"><span>ACTIVE WELL</span><button className="well-switch"><strong>{selectedWell}</strong><small>BARAIL · {telemetry.toLocaleString()} m</small><ChevronDown size={14} /></button></div><div className="sidebar-section"><span>QUICK ACTIONS</span><label className="sidebar-upload"><Upload size={15} /> Ingest document<input type="file" accept=".pdf,.png,.jpg,.jpeg,.tiff" onChange={handleUpload} /></label><button onClick={() => setView('prediction')}><Sparkles size={15} /> Ask NWIS</button></div><div className="sidebar-foot"><span><i className="online-dot" /> Local pipeline</span><small>DEMO DATASET · SYNTHETIC</small></div></aside><main className="main-content"><div className="page-heading"><div><span className="eyebrow">{view === 'command' ? 'FIELD OVERVIEW' : view === 'documents' ? 'DOCUMENT INTELLIGENCE' : view === 'embeddings' ? 'EVIDENCE GRAPH' : 'DECISION SUPPORT'}</span><h1>{view === 'command' ? 'Good morning, drilling team.' : view === 'documents' ? 'Make every report searchable.' : view === 'embeddings' ? 'See the memory of the field.' : 'Think one move ahead.'}</h1></div><span className="date-stamp">20 MAY 2025&nbsp;&nbsp; / &nbsp;&nbsp;SHIFT 02</span></div><div className="workspace">{renderView()}</div></main></div><div className="status-footer"><span><i className="online-dot" /> LOCAL PIPELINE ONLINE</span><span><FileText size={12} /> {uploadName}</span><span>ALL DATA STAYS ON DEVICE</span><CircleHelp size={13} /></div></div>
+function PdfViewer({ document }: { document: IndexedDocument }) {
+  const canvasRef = useRef<HTMLCanvasElement>(null); const [page, setPage] = useState(1)
+  const isImage = /\.(png|jpe?g|webp|tiff|bmp)$/i.test(document.name)
+  useEffect(() => {
+    if (isImage) return
+    let cancelled = false; (async () => { const pdf = await getDocument({ url: document.url }).promise; const current = await pdf.getPage(page); const viewport = current.getViewport({ scale: 1.5 }); const canvas = canvasRef.current; if (!canvas || cancelled) return; const context = canvas.getContext('2d'); if (!context) return; canvas.width = viewport.width; canvas.height = viewport.height; await current.render({ canvas, canvasContext: context, viewport }).promise })().catch(() => undefined); return () => { cancelled = true }
+  }, [document.url, page, isImage])
+  const segments = document.segments.filter((segment) => segment.page === page)
+  if (isImage) return <div className="pdf-canvas-shell"><div className="pdf-page-controls"><span>PAGE 1 OF 1 · IMAGE DOCUMENT</span></div><div className="pdf-page" style={{ display: 'grid', placeItems: 'center', overflow: 'auto' }}><img src={document.url} alt={document.name} style={{ maxWidth: '100%', maxHeight: '100%', objectFit: 'contain' }} />{segments.map((segment, index) => <div key={`${segment.label}-${index}`} className={`seg-box ${segment.tone} visible`} style={{ left: `${segment.x}%`, top: `${segment.y}%`, width: `${segment.w}%`, height: `${segment.h}%` }}><span>{segment.label}</span></div>)}</div></div>
+  return <div className="pdf-canvas-shell"><div className="pdf-page-controls"><button disabled={page === 1} onClick={() => setPage((current) => current - 1)}>← Previous</button><span>PAGE {page} OF {document.pages}</span><button disabled={page === document.pages} onClick={() => setPage((current) => current + 1)}>Next →</button></div><div className="pdf-page"><canvas ref={canvasRef} />{segments.map((segment, index) => <div key={`${segment.label}-${index}`} className={`seg-box ${segment.tone} visible`} style={{ left: `${segment.x}%`, top: `${segment.y}%`, width: `${segment.w}%`, height: `${segment.h}%` }}><span>{segment.label}</span></div>)}</div></div>
 }
 
 function PanelHeader({ icon, title, meta }: { icon: ReactNode; title: string; meta?: string }) { return <div className="panel-header"><span className="panel-title"><i>{icon}</i>{title}</span>{meta && <span className="panel-meta">{meta}</span>}</div> }
-function DepthPanel({ telemetry }: { telemetry: number }) {
-  return <>
-    <PanelHeader icon={<Activity size={16} />} title="ACTIVE WELL" meta="A-17 / LIVE" />
-    <div className="active-depth"><span>MD</span><strong>{telemetry.toLocaleString()} m</strong><b>FORMATION: BARAIL</b></div>
-    <div className="depth-head"><span>FORMATION</span><span>LIVE LOG</span><span>TVD (m)</span></div>
-    <div className="depth-chart">
-      <div className="formation-column">
-        <span>GIRUJ</span><span>PAB</span><span className="barail-upper">UPPER<br />BARAIL</span><span className="barail">BARAIL</span><span>LOWER<br />BARAIL</span><span>BASAL<br />SAND</span><span>PRE-CAMBRIAN<br />BASEMENT</span>
-      </div>
-      <div className="depth-log" aria-label="Live well log">
-        <div className="gamma-line" />
-        <div className="tvd-lines"><i /><i /><i className="hot" /><i /><i className="hot" /><i /><i /></div>
-      </div>
-      <div className="depth-labels"><span>2,000</span><span>2,200</span><span>2,400</span><span>2,600</span><span>2,800</span><span>3,000</span><span>3,200</span><span>3,400</span></div>
-      <div className="depth-marker" style={{ top: `${Math.min(92, 29 + (telemetry - 2800) * .3)}%` }}><span>{telemetry.toLocaleString()} m</span></div>
-    </div>
-    <div className="chart-legend"><span><i className="line cyan-line" />GAMMA (API)</span><span><i className="line coral-line" />ROP (m/h)</span></div>
-  </>
+function EmptyWorkspace({ view }: { view: View }) { const copy = view === 'documents' ? 'Upload a DDR, WCR, scan, or mud log to start OCR and factual extraction.' : view === 'embeddings' ? 'Upload and index documents before exploring their text-vector relationships.' : view === 'prediction' ? 'Upload an indexed report before asking evidence-grounded questions.' : 'Upload a drilling document to populate the map, well data, events, risks, and correlations.'; return <section className="empty-workspace"><FileScan size={30} /><h2>No operational data loaded</h2><p>{copy}</p><span>Use <b>Ingest document</b> in the sidebar to begin.</span></section> }
+
+function DocumentPanel({ document, processing, progress, status }: { document: IndexedDocument; processing: boolean; progress: number; status: string }) { return <><PanelHeader icon={<FileScan size={16} />} title="DOCUMENT INTELLIGENCE" meta={processing ? `${progress}%` : 'INDEXED'} /><div className="document-stage"><div className="paper"><PdfViewer document={document} /></div></div><div className="document-footer"><span><i className="live-dot" /> {status}</span><span>{document.segments.length} REGIONS · {document.pages} PAGES</span></div></> }
+
+function DepthPanel({ report }: { report: Report }) {
+  const formations = report.formations?.length ? report.formations : report.formation ? [{ name: report.formation, top_md: null, bottom_md: null }] : []
+  return <><PanelHeader icon={<Activity size={16} />} title="ACTIVE WELL" meta={report.well_name || 'NAME NOT FOUND'} /><div className="active-depth"><span>MEASURED DEPTH</span><strong>{value(report.current_md, ' m')}</strong><b>{report.formation || 'FORMATION NOT FOUND'}</b></div><div className="extracted-metrics"><span><small>TVD</small><b>{value(report.current_tvd, ' m')}</b></span><span><small>PROGRESS</small><b>{value(report.progress, ' m')}</b></span><span><small>AVG ROP</small><b>{value(report.avg_rop, ' m/h')}</b></span><span><small>MUD WEIGHT</small><b>{value(report.mud_weight)}</b></span></div><div className="formation-list">{formations.length ? formations.map((formation, index) => <div key={`${formation.name}-${index}`}><strong>{formation.name}</strong><span>{formation.top_md === null && formation.bottom_md === null ? 'Depth interval not stated' : `${value(formation.top_md, ' m')} – ${value(formation.bottom_md, ' m')}`}</span></div>) : <p>No formation intervals found in the document.</p>}</div></>
 }
-function PdfPage({ pages }: { pages: number }) { const canvasRef = useRef<HTMLCanvasElement>(null); const [page, setPage] = useState(1); useEffect(() => { let cancelled = false; (async () => { const pdf = await getDocument({ url: activePreviewUrl }).promise; const current = await pdf.getPage(page); const viewport = current.getViewport({ scale: 1.45 }); const canvas = canvasRef.current; if (!canvas || cancelled) return; const context = canvas.getContext('2d'); if (!context) return; canvas.width = viewport.width; canvas.height = viewport.height; await current.render({ canvas, canvasContext: context, viewport }).promise })().catch(() => undefined); return () => { cancelled = true } }, [page]); return <div className="pdf-canvas-shell"><div className="pdf-page-controls"><button disabled={page === 1} onClick={() => setPage((value) => value - 1)}>← Previous</button><span>PAGE {page} OF {pages}</span><button disabled={page === pages} onClick={() => setPage((value) => value + 1)}>Next →</button></div><div className="pdf-page"><canvas ref={canvasRef} />{blocks.map((block, index) => <div key={block.id} className={`seg-box ${block.tone} ${index < 6 ? 'visible' : ''}`} style={{ left: `${block.x}%`, top: `${block.y}%`, width: `${block.w}%`, height: `${block.h}%` }}><span>{block.label}</span></div>)}</div></div> }
-function DocumentPanel({ processing, progress, ocrStatus, parsedPages }: { processing: boolean; progress: number; ocrStatus: string; parsedPages: number }) { return <><PanelHeader icon={<FileScan size={16} />} title="DOCUMENT INTELLIGENCE" meta={processing ? 'PROCESSING' : 'INDEXED'} /><div className="document-stage"><div className="paper"><PdfPage pages={parsedPages} /></div></div><div className="document-footer"><span><i className="live-dot" /> {processing ? `PARSING PAGE 01 · ${progress}%` : `${ocrStatus} · ${parsedPages} PAGES`}</span><span>CONFIDENCE <b>0.93</b> <ChevronDown size={13} /></span></div></> }
-function EmbeddingPanel({ selectedEvent, setSelectedEvent }: { selectedEvent: string; setSelectedEvent: (value: string) => void }) { return <><PanelHeader icon={<Network size={16} />} title="EVIDENCE EMBEDDING SPACE" meta="UMAP / 148 PASSAGES" /><div className="embedding-canvas large-canvas"><div className="embedding-axis horizontal" /><div className="embedding-axis vertical" /><span className="cluster-label label-loss">MUD LOSS</span><span className="cluster-label label-pressure">PRESSURE</span><span className="cluster-label label-pipe">STUCK PIPE</span><span className="cluster-label label-cement">CEMENTING</span>{embeddingPoints.map(([x, y, tone], index) => <button key={index} className={`embedding-point ${tone} ${index === 2 ? 'selected' : ''}`} style={{ left: `${x}%`, top: `${y}%` }} onClick={() => setSelectedEvent(tone === 'coral' ? 'Stuck pipe' : tone === 'amber' ? 'Formation pressure' : 'Partial returns')} aria-label={`Evidence point ${index + 1}`} />)}<div className="embedding-tooltip"><strong>{selectedEvent}</strong><span>12 related passages</span><small>A-08 · A-15 · A-17</small></div></div></> }
-function StreamPanel({ ocrStatus }: { ocrStatus: string }) { return <><PanelHeader icon={<Zap size={16} />} title="LIVE PARSING STREAM" meta="LOCAL WORKER" /><div className="stream-list"><StreamItem time="NOW" icon={<FileText size={15} />} title="PDF + OCR extraction" detail={ocrStatus} tone="cyan" /><StreamItem time="NOW" icon={<Database size={15} />} title="Formation entity linked" detail={`${ddrRecord.formation} · 2,760–3,050 m · 0.93`} tone="cyan" /><StreamItem time="NOW" icon={<AlertTriangle size={15} />} title="Historical event matched" detail={`${ddrRecord.events[0].title} at ${ddrRecord.events[0].depth.toLocaleString()} m · A-08`} tone="amber" /><StreamItem time="NOW" icon={<BrainCircuit size={15} />} title="Embedding cluster updated" detail={`${ddrRecord.offsets.length} nearby well contexts indexed`} tone="violet" /></div></> }
-function StreamItem({ time, icon, title, detail, tone }: { time: string; icon: ReactNode; title: string; detail: string; tone: string }) { return <div className="stream-item"><time>{time}</time><span className={`stream-icon ${tone}`}>{icon}</span><div><strong>{title}</strong><span>{detail}</span></div><ArrowUpRight size={13} /></div> }
-function PredictionPanel({ prediction, setPrediction, question, setQuestion, askPrediction }: { prediction: boolean; setPrediction: (value: boolean) => void; question: string; setQuestion: (value: string) => void; askPrediction: (event: FormEvent) => void }) { return <><PanelHeader icon={<Sparkles size={16} />} title="PREDICTION MODE" meta="EVIDENCE-GROUNDED" />{!prediction ? <><p className="prediction-intro">Ask what the current trajectory means before you commit to the next operational decision.</p><form className="ask-form" onSubmit={askPrediction}><textarea value={question} onChange={(event) => setQuestion(event.target.value)} placeholder="e.g. If we increase mud weight by 0.4 SG at Barail top, what could go wrong?" /><button type="submit"><Send size={15} /> ASK NWIS</button></form><div className="suggestion-row"><button onClick={() => setQuestion('What risks are likely in the next 100 m?')}>NEXT 100 M <ArrowDownRight size={13} /></button><button onClick={() => setQuestion('Compare this formation with A-08.')}>COMPARE A-08 <ArrowUpRight size={13} /></button></div></> : <div className="prediction-result"><div className="prediction-result-head"><span className="result-chip"><AlertTriangle size={13} /> ELEVATED RISK</span><button onClick={() => setPrediction(false)} aria-label="Close prediction"><X size={14} /></button></div><h3>Partial losses are the leading concern.</h3><p>At Barail top, the proposed increase may improve overbalance but could worsen losses in the fractured sandstone interval.</p><div className="evidence-list"><span><i />A-08 · Partial returns at 2,790 m</span><span><i />A-15 · Mud-weight increase preceded losses</span></div><div className="recommendation"><b>CHECK BEFORE PROCEEDING</b><span>Confirm flow-out trend, ECD margin, and loss rate over the next 15 minutes.</span></div></div>}</> }
-function RiskRow({ telemetry, setSelectedEvent, setView }: { telemetry: number; setSelectedEvent: (value: string) => void; setView: (view: View) => void }) { return <section className="risk-row"><div className="risk-label"><AlertTriangle size={25} /><div><small>LIVE DECISION SUPPORT</small><strong>RISK WATCH</strong></div></div><RiskCard label="MUD LOSS" value="72%" trend="RISING" tone="critical" icon="◌" onClick={() => setSelectedEvent('Partial returns')} /><RiskCard label="STUCK PIPE" value="41%" trend="RISING" tone="critical" icon="⌁" onClick={() => setSelectedEvent('Stuck pipe')} /><RiskCard label="WELLBORE INSTABILITY" value="28%" trend="STEADY" tone="warning" icon="◇" onClick={() => setSelectedEvent('Wellbore instability')} /><RiskCard label="FORMATION PRESSURE" value="35%" trend="STEADY" tone="warning" icon="◉" onClick={() => setSelectedEvent('Formation pressure')} /><div className="alerts-card"><div><span className="alert-count">ALERTS (2)</span><span>09:41&nbsp;&nbsp; Partial Returns @ {telemetry.toLocaleString()} m</span><span>09:35&nbsp;&nbsp; High Flow Deviation</span></div><button onClick={() => setView('prediction')}>VIEW ALL <ArrowUpRight size={13} /></button></div></section> }
-function RiskCard({ label, value, trend, tone, icon, onClick }: { label: string; value: string; trend: string; tone: Tone; icon: string; onClick: () => void }) { return <button className={`risk-card ${tone}`} onClick={onClick}><span className="risk-icon">{icon}</span><div><small>{label}</small><strong>{value}</strong><span className="risk-trend">TREND&nbsp; <b>{trend}</b></span></div><span className="sparkline">⌁⌁⌁</span></button> }
+
+function StreamPanel({ document, status }: { document: IndexedDocument; status: string }) {
+  const items = [{ title: 'PDF + OCR extraction', detail: status, icon: <FileText size={15} />, tone: 'cyan' }, ...document.report.sections.slice(0, 2).map((section) => ({ title: section.label, detail: section.summary || 'Section indexed', icon: <Database size={15} />, tone: 'cyan' })), ...document.report.events.slice(0, 2).map((event) => ({ title: event.type, detail: `${event.depth === null ? 'Depth not stated' : `${event.depth.toLocaleString()} m`} · ${event.evidence}`, icon: <AlertTriangle size={15} />, tone: 'amber' }))]
+  return <><PanelHeader icon={<Zap size={16} />} title="LIVE PARSING STREAM" meta="DOCUMENT PIPELINE" /><div className="stream-list">{items.map((item, index) => <div className="stream-item" key={`${item.title}-${index}`}><time>NOW</time><span className={`stream-icon ${item.tone}`}>{item.icon}</span><div><strong>{item.title}</strong><span>{item.detail}</span></div><ArrowUpRight size={13} /></div>)}</div></>
+}
+
+function RiskRow({ risks, events, openPrediction }: { risks: Risk[]; events: Event[]; openPrediction: () => void }) {
+  return <section className="risk-row dynamic-risk-row"><div className="risk-label"><AlertTriangle size={25} /><div><small>DOCUMENT EVIDENCE</small><strong>RISK WATCH</strong></div></div>{risks.length ? risks.slice(0, 4).map((risk) => <button className={`risk-card ${risk.trend === 'rising' ? 'critical' : 'warning'}`} key={risk.label} title={risk.evidence}><div><small>{risk.label}</small><strong>{risk.probability === null ? '—' : `${risk.probability}%`}</strong><span className="risk-trend">TREND&nbsp; <b>{risk.trend || 'NOT STATED'}</b></span></div></button>) : <div className="no-risk-data">No risk probabilities were stated or extracted.</div>}<div className="alerts-card"><div><span className="alert-count">EVENTS ({events.length})</span>{events.slice(0, 2).map((event, index) => <span key={`${event.type}-${index}`}>{event.time || 'Time not stated'} · {event.type}{event.depth === null ? '' : ` @ ${event.depth.toLocaleString()} m`}</span>)}</div><button onClick={openPrediction}>ASK ABOUT EVENTS <ArrowUpRight size={13} /></button></div></section>
+}
+
+function EmbeddingPanel({ embeddings, model }: { embeddings: Embedding[]; model: string }) {
+  const [selected, setSelected] = useState<Embedding | null>(embeddings[0] || null)
+  return <><PanelHeader icon={<Network size={16} />} title="DOCUMENT TEXT VECTOR SPACE" meta={`${model} · ${embeddings.length} CHUNKS`} /><div className="embedding-canvas large-canvas"><div className="embedding-axis horizontal" /><div className="embedding-axis vertical" />{embeddings.map((point, index) => <button key={point.id} className={`embedding-point ${index % 3 === 0 ? 'coral' : index % 3 === 1 ? 'cyan' : 'amber'} ${selected?.id === point.id ? 'selected' : ''}`} style={{ left: `${point.x}%`, top: `${point.y}%` }} onClick={() => setSelected(point)} aria-label={point.label} />)}{selected && <div className="embedding-tooltip"><strong>{selected.label}</strong><span>{selected.excerpt}</span></div>}</div></>
+}
+
+function PredictionPanel({ document, question, setQuestion }: { document: IndexedDocument; question: string; setQuestion: (value: string) => void }) {
+  const [answer, setAnswer] = useState(''); const [asking, setAsking] = useState(false)
+  async function ask(event: FormEvent) { event.preventDefault(); if (!question.trim()) return; setAsking(true); setAnswer(''); try { const response = await fetch('/api/ask', { method: 'POST', headers: { 'content-type': 'application/json' }, body: JSON.stringify({ question, corpus: document.corpus }) }); const payload = await response.json(); if (!response.ok) throw new Error(payload.error); setAnswer(payload.answer) } catch (error) { setAnswer(error instanceof Error ? error.message : 'Ask NWIS failed.') } finally { setAsking(false) } }
+  return <><PanelHeader icon={<Sparkles size={16} />} title="ASK NWIS" meta="UPLOADED DOCUMENTS ONLY" />{answer ? <div className="prediction-result"><div className="prediction-result-head"><span className="result-chip"><BrainCircuit size={13} /> GROQ ANALYSIS</span><button onClick={() => setAnswer('')} aria-label="Close answer"><X size={14} /></button></div><h3>{question}</h3><p className="ai-answer">{answer}</p></div> : <><p className="prediction-intro">Ask a drilling question. The response is constrained to the currently uploaded document.</p><form className="ask-form" onSubmit={ask}><textarea value={question} onChange={(event) => setQuestion(event.target.value)} placeholder="Ask about a depth, event, formation, mud property, or operational decision…" /><button type="submit" disabled={asking}><Send size={15} /> {asking ? 'ANALYSING…' : 'ASK NWIS'}</button></form></>}</>
+}
+
+export default function App() {
+  const [view, setView] = useState<View>('command'); const [sidebarOpen, setSidebarOpen] = useState(true); const [document, setDocument] = useState<IndexedDocument | null>(null); const [processing, setProcessing] = useState(false); const [progress, setProgress] = useState(0); const [status, setStatus] = useState('No document indexed'); const [error, setError] = useState(''); const [question, setQuestion] = useState(''); const [dragOver, setDragOver] = useState(false)
+  const documentUrlRef = useRef<string | null>(null)
+  useEffect(() => () => { if (documentUrlRef.current) URL.revokeObjectURL(documentUrlRef.current) }, [])
+  async function ingestFile(file: File) {
+    if (documentUrlRef.current) { URL.revokeObjectURL(documentUrlRef.current); documentUrlRef.current = null }
+    setProcessing(true); setProgress(1); setError(''); setStatus(`Opening ${file.name}`); setView('documents')
+    try {
+      const { analysis, pages } = await analyseDocument(file, (nextProgress, nextStatus) => { setProgress(nextProgress); setStatus(nextStatus) })
+      const url = URL.createObjectURL(file)
+      documentUrlRef.current = url
+      setDocument({ ...analysis, name: file.name, url, pages }); setStatus(`Indexed ${analysis.report.sections.length} factual sections from ${pages} pages`)
+    } catch (uploadError) { setDocument(null); setError(uploadError instanceof Error ? uploadError.message : 'Document processing failed.'); setStatus('Document processing failed') } finally { setProcessing(false) }
+  }
+  async function handleUpload(event: ChangeEvent<HTMLInputElement>) { const file = event.target.files?.[0]; if (!file) return; await ingestFile(file); event.target.value = '' }
+  const report = document?.report
+  const navItems: [View, ReactNode, string][] = [['command', <Crosshair size={17} />, 'Command Center'], ['documents', <FileScan size={17} />, 'Documents'], ['embeddings', <Network size={17} />, 'Embedding Explorer'], ['prediction', <BrainCircuit size={17} />, 'Prediction Mode']]
+  function renderView() {
+    if (!document || !report) return <EmptyWorkspace view={view} />
+    if (view === 'documents') return <div className="view-grid documents-view"><div className="panel document-panel"><DocumentPanel document={document} processing={processing} progress={progress} status={status} /></div><div className="panel activity-panel"><StreamPanel document={document} status={status} /></div></div>
+    if (view === 'embeddings') return <div className="view-grid embeddings-view"><div className="panel embeddings-panel"><EmbeddingPanel embeddings={document.embeddings} model={document.embeddingModel} /></div><div className="panel panel-copy"><PanelHeader icon={<MapPinned size={16} />} title="DOCUMENT WELL CONTEXT" meta={`${report.offset_wells.length} OFFSET REFERENCES`} /><h2>{report.well_name || 'Well name not found'}</h2><p>{report.lease_block || 'No lease or block was found in the document.'}</p><div className="linked-well-list">{report.offset_wells.length ? report.offset_wells.map((well) => <button key={well.id}><span>{well.id}</span><small>{value(well.depth, ' m')} · {value(well.distance_km, ' km')}</small><ArrowUpRight size={14} /></button>) : <p>No offset wells were explicitly identified.</p>}</div></div></div>
+    if (view === 'prediction') return <div className="view-grid prediction-view"><div className="panel prediction-panel large"><PredictionPanel document={document} question={question} setQuestion={setQuestion} /></div><div className="panel panel-copy"><PanelHeader icon={<Bell size={16} />} title="EXTRACTED EVENTS" meta={`${report.events.length} FOUND`} /><div className="alert-log">{report.events.length ? report.events.map((event, index) => <span key={`${event.type}-${index}`}><b>{event.time || '—'}</b>{event.type}{event.depth === null ? '' : ` · ${event.depth.toLocaleString()} m`}</span>) : <span>No operational events found.</span>}</div></div></div>
+    return <><div className="hero-grid"><div className="panel map-panel"><PanelHeader icon={<MapPinned size={16} />} title="DOCUMENT WELL LOCATIONS" meta={report.latitude === null || report.longitude === null ? 'COORDINATES NOT FOUND' : `${1 + report.offset_wells.filter((well) => well.latitude !== null && well.longitude !== null).length} MAPPED`} /><FieldMap report={report} /></div><div className="panel depth-panel"><DepthPanel report={report} /></div><div className="panel document-panel"><DocumentPanel document={document} processing={processing} progress={progress} status={status} /></div></div><RiskRow risks={report.risks || []} events={report.events || []} openPrediction={() => setView('prediction')} /><div className="lower-grid"><div className="panel activity-panel"><StreamPanel document={document} status={status} /></div><div className="panel prediction-panel"><PredictionPanel document={document} question={question} setQuestion={setQuestion} /></div></div></>
+  }
+  const heading = view === 'command' ? 'Operational evidence from uploaded documents.' : view === 'documents' ? 'Make every report searchable.' : view === 'embeddings' ? 'Explore this document’s evidence.' : 'Ask against indexed evidence.'
+  function onDragOver(event: React.DragEvent) { event.preventDefault(); if (!dragOver) setDragOver(true) }
+  function onDragLeave(event: React.DragEvent) { if (!(event.currentTarget as HTMLElement).contains(event.relatedTarget as Node)) setDragOver(false) }
+  async function onDrop(event: React.DragEvent) { event.preventDefault(); setDragOver(false); const file = event.dataTransfer.files?.[0]; if (file) await ingestFile(file) }
+  return <div className={`app-shell ${sidebarOpen ? '' : 'sidebar-collapsed'}` + (dragOver ? ' drag-active' : '')} onDragOver={onDragOver} onDragLeave={onDragLeave} onDrop={onDrop}><header className="topbar"><button className="sidebar-toggle" onClick={() => setSidebarOpen((open) => !open)} aria-label={sidebarOpen ? 'Collapse navigation' : 'Open navigation'}>{sidebarOpen ? <PanelLeftClose size={18} /> : <Menu size={18} />}</button><div className="brand-lockup"><div className="brand-mark">N°</div><div><div className="brand-title">NWIS</div><div className="brand-subtitle">NEARBY WELLS INTELLIGENCE</div></div></div><div className="top-search"><Search size={15} /><span>Search indexed document evidence…</span></div><div className="top-actions"><span className="online-pill"><i /> {processing ? `PROCESSING ${progress}%` : document ? 'DOCUMENT INDEXED' : 'AWAITING DOCUMENT'}</span><button aria-label="Notifications"><Bell size={17} /></button><button aria-label="Settings"><Settings2 size={17} /></button></div></header><div className="app-layout"><aside className="sidebar"><div className="sidebar-top"><span>WORKSPACE</span><button onClick={() => setSidebarOpen(false)} aria-label="Collapse sidebar"><PanelLeftClose size={15} /></button></div><nav>{navItems.map(([id, icon, label]) => <button key={id} className={view === id ? 'active' : ''} onClick={() => setView(id)}>{icon}<span>{label}</span></button>)}</nav><div className="sidebar-section"><span>ACTIVE WELL</span><button className="well-switch"><strong>{report?.well_name || 'No well indexed'}</strong><small>{report ? `${report.formation || 'Formation not found'} · ${value(report.current_md, ' m')}` : 'Upload a drilling document'}</small><ChevronDown size={14} /></button></div><div className="sidebar-section"><span>QUICK ACTIONS</span><label className="sidebar-upload" title="Select a PDF or image drilling report"><Upload size={15} /> Ingest document<input type="file" accept=".pdf,.png,.jpg,.jpeg,.tiff,.bmp,.webp" onChange={handleUpload} /></label><button disabled={!document} onClick={() => setView('prediction')}><Sparkles size={15} /> Ask NWIS</button></div><div className="sidebar-foot"><span><i className="online-dot" /> {processing ? status : document ? 'Index ready' : 'No dataset loaded'}</span><small>{document?.name || 'NO DOCUMENT'}</small></div></aside><main className="main-content"><div className="page-heading"><div><span className="eyebrow">{view === 'command' ? 'FIELD OVERVIEW' : view === 'documents' ? 'DOCUMENT INTELLIGENCE' : view === 'embeddings' ? 'EVIDENCE GRAPH' : 'DECISION SUPPORT'}</span><h1>{heading}</h1></div><span className="date-stamp">{report?.report_date || 'DATE NOT FOUND'}{report?.report_number ? ` / ${report.report_number}` : ''}</span></div>{error && <div className="pipeline-error"><AlertTriangle size={15} />{error}</div>}<div className="workspace">{renderView()}</div></main></div>{dragOver && <div className="drag-overlay"><Upload size={22} /><span>Drop DDR / WCR / scan to ingest</span></div>}<div className="status-footer"><span><i className="online-dot" /> {processing ? status : document ? 'INDEXED FROM UPLOADED DOCUMENT' : 'AWAITING UPLOAD'}</span><span><FileText size={12} /> {document?.name || 'No document indexed'}</span><span>{document ? `${document.report.sections.length} sections · ${document.report.events.length} events · ${document.embeddings.length} vectors` : 'No operational data loaded'}</span><CircleHelp size={13} /></div></div>
+}

@@ -67,7 +67,7 @@ story += [table([
     ["Well Name:", "A-17 / Barail North", "Report Date:", "2026-09-02"],
     ["API / UWI:", "OIL-A17-2026-014", "Report No:", "Day 14"],
     ["Latitude:", "26.123456 N", "Spud Date:", "2026-08-19"],
-    ["Longitude:", "97.654321 E", "Operator:", "Oil India Limited"],
+    ["Longitude:", "93.654321 E", "Operator:", "Oil India Limited"],
     ["Lease/Block:", "Barail North / Block 12", "Rig Name:", "BoreMax Rig 5"],
 ], [1.15*inch, 2.55*inch, 1.15*inch, 2.35*inch])]
 story += [section("OPERATIONS SUMMARY & DEPTH TRACKING"), table([

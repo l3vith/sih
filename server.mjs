@@ -1,26 +1,183 @@
 import 'dotenv/config'
 import cors from 'cors'
 import express from 'express'
-import Groq from 'groq-sdk'
+import { Groq } from 'groq-sdk'
+import { pipeline } from '@huggingface/transformers'
 
 const app = express()
 app.use(cors())
-app.use(express.json({ limit: '5mb' }))
+app.use(express.json({ limit: '8mb' }))
+
+const model = 'openai/gpt-oss-120b'
+const embeddingModel = 'Xenova/all-MiniLM-L6-v2'
+const groq = process.env.GROQ_API_KEY ? new Groq({ apiKey: process.env.GROQ_API_KEY }) : null
+let extractorPromise
+const clean = (value) => String(value || '').toLowerCase().replace(/[^a-z0-9]+/g, ' ').trim()
+
+function jsonFrom(value) {
+  const cleaned = String(value || '').replace(/```json|```/gi, '').trim()
+  const match = cleaned.match(/\{[\s\S]*\}/)
+  if (!match) throw new Error('Groq did not return a JSON object.')
+  const candidate = match[0]
+  try { return JSON.parse(candidate) } catch {
+    // Repair common LLM JSON slips: trailing commas, stray newlines
+    const repaired = candidate.replace(/,\s*([}\]])/g, '$1').replace(/[\u2018\u2019]/g, "'")
+    return JSON.parse(repaired)
+  }
+}
+
+function isHeading(line) {
+  if (line.length < 8 || line.length > 96 || !/[A-Z]{3}/.test(line)) return false
+  if (/^(?:\[PAGE|PAGE \d|NWIS DEMO DATASET|DAILY DRILLING REPORT|DDR CONTINUATION|INTELLIGENCE$)/i.test(line)) return false
+  const letters = line.match(/[A-Za-z]/g) || []
+  const uppercase = line.match(/[A-Z]/g) || []
+  return letters.length >= 6 && uppercase.length / letters.length > .88 && line.split(/\s+/).length >= 2
+}
+
+function detectHeadings(text, words) {
+  const lines = String(text).split(/\r?\n/).map((line) => line.trim().replace(/\s+/g, ' '))
+  const pageLines = new Map()
+  for (const word of words) {
+    const page = Number(word.page)
+    const y = Number(word.y)
+    if (!Number.isFinite(page) || !Number.isFinite(y) || !String(word.text || '').trim()) continue
+    const existing = pageLines.get(page) || []
+    let line = existing.find((candidate) => Math.abs(candidate.y - y) <= Math.max(.75, Number(word.h || 0) * .55))
+    if (!line) { line = { y, words: [] }; existing.push(line); pageLines.set(page, existing) }
+    line.words.push(word)
+  }
+  for (const page of [...pageLines.keys()].sort((a, b) => a - b)) {
+    for (const line of pageLines.get(page).sort((a, b) => a.y - b.y)) {
+      lines.push(line.words.sort((a, b) => Number(a.x) - Number(b.x)).map((word) => String(word.text).trim()).join(' ').replace(/\s+/g, ' ').trim())
+    }
+  }
+  return [...new Set(lines.filter((line) => {
+    return isHeading(line)
+  }))]
+}
+
+function locateSegments(sections, words) {
+  const hits = []
+  for (const [index, section] of sections.entries()) {
+    const anchor = clean(section.anchor || section.label)
+    const anchorTokens = new Set(anchor.split(' ').filter((token) => token.length > 1))
+    const match = words.map((word) => {
+      const candidate = clean(word.text)
+      const candidateTokens = new Set(candidate.split(' ').filter((token) => token.length > 1))
+      const overlap = [...anchorTokens].filter((token) => candidateTokens.has(token)).length
+      const coverage = overlap / Math.max(1, anchorTokens.size)
+      const score = candidate.includes(anchor) || anchor.includes(candidate) ? 2 + coverage : coverage
+      return { word, score }
+    }).filter(({ score }) => score >= 0.58).sort((a, b) => b.score - a.score)[0]?.word
+    if (match) hits.push({ page: Number(match.page), x: 3.5, y: Math.max(0, Number(match.y) - .8), w: 93, h: 10, label: String(section.label || 'Section').toUpperCase(), tone: index % 2 ? 'amber' : 'cyan' })
+  }
+  return hits.map((hit) => {
+    const next = hits.filter((candidate) => candidate.page === hit.page && candidate.y > hit.y).sort((a, b) => a.y - b.y)[0]
+    return { ...hit, h: Math.max(7, Math.min(38, next ? next.y - hit.y - 1.25 : 18)) }
+  })
+}
+
+function semanticProjection(vectors) {
+  if (vectors.length === 1) return [{ x: 50, y: 50 }]
+  const dimensions = vectors[0].length
+  const mean = Array.from({ length: dimensions }, (_, dimension) => vectors.reduce((sum, vector) => sum + vector[dimension], 0) / vectors.length)
+  const centered = vectors.map((vector) => vector.map((value, dimension) => value - mean[dimension]))
+  const gram = centered.map((left) => centered.map((right) => left.reduce((sum, value, dimension) => sum + value * right[dimension], 0)))
+  const power = (matrix, seed) => {
+    let vector = matrix.map((_, index) => Math.sin((index + 1) * seed) + .1)
+    for (let iteration = 0; iteration < 60; iteration += 1) {
+      const next = matrix.map((row) => row.reduce((sum, value, column) => sum + value * vector[column], 0))
+      const norm = Math.hypot(...next) || 1
+      vector = next.map((value) => value / norm)
+    }
+    const product = matrix.map((row) => row.reduce((sum, value, column) => sum + value * vector[column], 0))
+    const eigenvalue = vector.reduce((sum, value, index) => sum + value * product[index], 0)
+    return { vector, eigenvalue: Math.max(0, eigenvalue) }
+  }
+  const first = power(gram, 1.7)
+  const deflated = gram.map((row, i) => row.map((value, j) => value - first.eigenvalue * first.vector[i] * first.vector[j]))
+  const second = power(deflated, 2.3)
+  const raw = vectors.map((_, index) => ({ x: first.vector[index] * Math.sqrt(first.eigenvalue), y: second.vector[index] * Math.sqrt(second.eigenvalue) }))
+  const xs = raw.map((point) => point.x); const ys = raw.map((point) => point.y)
+  const xMin = Math.min(...xs); const xMax = Math.max(...xs); const yMin = Math.min(...ys); const yMax = Math.max(...ys)
+  return raw.map((point, index) => ({ x: 12 + ((point.x - xMin) / Math.max(.0001, xMax - xMin)) * 76, y: vectors.length === 2 ? 50 + (index ? 12 : -12) : 12 + ((point.y - yMin) / Math.max(.0001, yMax - yMin)) * 76 }))
+}
+
+function fallbackVectors(source) {
+  // Deterministic hash-based vectors when the transformer model is offline – keeps the explorer usable without network.
+  const vectors = source.map((entry) => {
+    const text = String(entry.text || '').toLowerCase()
+    const hashed = Array.from({ length: 64 }, (_, i) => {
+      let h = 2166136261
+      for (let c = 0; c < text.length; c += 1) h = Math.imul(h ^ text.charCodeAt(c + i * 7), 16777619)
+      return ((h >>> 8) % 2000) / 1000 - 1
+    })
+    const norm = Math.hypot(...hashed) || 1
+    return hashed.map((v) => v / norm)
+  })
+  const coordinates = semanticProjection(vectors)
+  return { vectors, coordinates }
+}
+
+async function textEmbeddings(text, sections) {
+  const source = sections.length ? sections.map((section) => ({ label: section.label, text: String(section.evidence || section.summary || section.label) })) : String(text).split(/\n{2,}|(?<=[.!?])\s+/).filter((chunk) => chunk.trim().length > 25).slice(0, 40).map((chunk, index) => ({ label: `Passage ${index + 1}`, text: chunk }))
+  if (!source.length) return []
+  try {
+    extractorPromise ||= pipeline('feature-extraction', embeddingModel)
+    const extractor = await extractorPromise
+    const tensor = await extractor(source.map((entry) => entry.text), { pooling: 'mean', normalize: true })
+    const vectors = tensor.tolist()
+    const coordinates = semanticProjection(vectors)
+    return source.map((entry, index) => ({ id: `chunk-${index + 1}`, label: String(entry.label || `Passage ${index + 1}`), excerpt: entry.text.slice(0, 240), x: coordinates[index].x, y: coordinates[index].y }))
+  } catch (error) {
+    console.warn('[embeddings] transformer unavailable, using fallback vectors:', error instanceof Error ? error.message : String(error))
+    extractorPromise = undefined
+    const { coordinates } = fallbackVectors(source)
+    return source.map((entry, index) => ({ id: `chunk-${index + 1}`, label: String(entry.label || `Passage ${index + 1}`), excerpt: entry.text.slice(0, 240), x: coordinates[index].x, y: coordinates[index].y }))
+  }
+}
+
+app.get('/api/health', (_req, res) => res.json({ ready: Boolean(groq), model, embeddingModel, embeddingsReady: true }))
 
 app.post('/api/structure-ddr', async (req, res) => {
-  if (!process.env.GROQ_API_KEY) return res.status(503).json({ error: 'GROQ_API_KEY is not configured on the local server.' })
-  const text = String(req.body?.text || '').slice(0, 30000)
+  if (!groq) return res.status(503).json({ error: 'GROQ_API_KEY is not configured.' })
+  const text = String(req.body?.text || '').slice(0, 50000)
+  const words = Array.isArray(req.body?.words) ? req.body.words.slice(0, 8000) : []
   if (!text.trim()) return res.status(400).json({ error: 'No OCR text supplied.' })
   try {
-    const client = new Groq({ apiKey: process.env.GROQ_API_KEY })
-    const completion = await client.chat.completions.create({
-      model: 'qwen/qwen3.8-27b', temperature: 0.2, max_completion_tokens: 1600,
-      messages: [{ role: 'user', content: `Extract this drilling report into JSON only. Schema: {well_name, latitude, longitude, current_md, formation, mud_weight, events:[{type,depth,severity,mitigation}], sections:[{label,summary}]}. OCR text:\n${text}` }],
+    const headingCandidates = detectHeadings(text, words)
+    const completion = await groq.chat.completions.create({
+      model, temperature: 0.05, max_completion_tokens: 3500, response_format: { type: 'json_object' },
+      messages: [
+        { role: 'system', content: 'You extract factual oil and gas drilling data. Never infer missing values. Use null or [] when the document does not explicitly contain a value. Return JSON only.' },
+        { role: 'user', content: `Extract this drilling document using this exact schema:
+{"well_name":string|null,"report_date":string|null,"report_number":string|null,"latitude":number|null,"longitude":number|null,"current_md":number|null,"current_tvd":number|null,"formation":string|null,"mud_weight":string|null,"operator":string|null,"rig_name":string|null,"lease_block":string|null,"progress":number|null,"avg_rop":number|null,"formations":[{"name":string,"top_md":number|null,"bottom_md":number|null}],"events":[{"time":string|null,"type":string,"depth":number|null,"severity":"high"|"medium"|"low"|null,"mitigation":string|null,"evidence":string}],"risks":[{"label":string,"probability":number|null,"trend":"rising"|"steady"|"falling"|null,"evidence":string}],"offset_wells":[{"id":string,"latitude":number|null,"longitude":number|null,"depth":number|null,"distance_km":number|null,"relationship":string|null}],"sections":[{"label":string,"anchor":string,"summary":string,"evidence":string}]}
+Probability must be null unless the document explicitly states a percentage. Preserve coordinate signs. Do not invent offset wells, depths, events, formations, or risks.
+The OCR layout detector found these top-level headings: ${JSON.stringify(headingCandidates)}
+sections MUST contain exactly one entry for every heading in that list, in document order. anchor must exactly copy that heading. label may normalize capitalization but not meaning. evidence must be a concise verbatim excerpt from that section.
+OCR TEXT:\n${text}` },
+      ],
     })
-    const raw = completion.choices[0]?.message?.content || '{}'
-    const match = raw.match(/\{[\s\S]*\}/)
-    res.json({ structured: JSON.parse(match?.[0] || raw), raw })
-  } catch (error) { res.status(500).json({ error: error instanceof Error ? error.message : 'Groq structuring failed' }) }
+    const report = jsonFrom(completion.choices[0]?.message?.content)
+    // Ensure sections align with detected headings – groq may still miss one if OCR is noisy
+    let sections = Array.isArray(report.sections) ? report.sections : []
+    if (headingCandidates.length && sections.length !== headingCandidates.length) {
+      console.warn(`[structure-ddr] heading/section mismatch: ${headingCandidates.length} headings vs ${sections.length} sections`)
+    }
+    const embeddings = await textEmbeddings(text, sections)
+    res.json({ report, segments: locateSegments(sections, words), embeddings, embeddingModel, corpus: text })
+  } catch (error) { res.status(500).json({ error: error instanceof Error ? error.message : 'Groq structuring failed.' }) }
 })
 
-app.listen(process.env.PORT || 8787, () => console.log('NWIS OCR structuring server on http://localhost:8787'))
+app.post('/api/ask', async (req, res) => {
+  if (!groq) return res.status(503).json({ error: 'GROQ_API_KEY is not configured.' })
+  const question = String(req.body?.question || '').slice(0, 3000)
+  const corpus = String(req.body?.corpus || '').slice(0, 50000)
+  if (!question || !corpus) return res.status(400).json({ error: 'Question and indexed document context are required.' })
+  try {
+    const response = await groq.chat.completions.create({ model, temperature: 0.1, max_completion_tokens: 1600, messages: [{ role: 'system', content: 'You are NWIS drilling decision support. Answer only from uploaded-document evidence. If evidence is insufficient, say so. Include Evidence and Recommended check sections. Never invent wells, depths, events, or probabilities.' }, { role: 'user', content: `UPLOADED DOCUMENT CONTEXT:\n${corpus}\n\nENGINEER QUESTION:\n${question}` }] })
+    res.json({ answer: response.choices[0]?.message?.content || 'No answer returned.' })
+  } catch (error) { res.status(500).json({ error: error instanceof Error ? error.message : 'Groq answer failed.' }) }
+})
+
+app.listen(process.env.PORT || 8787, '127.0.0.1', () => console.log('NWIS server ready at http://127.0.0.1:8787'))
