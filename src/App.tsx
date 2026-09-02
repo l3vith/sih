@@ -64,13 +64,75 @@ async function getTrOCR(handwritten = true): Promise<any> {
 
 type CombinedOCRResult = { text: string; words: Array<{ text: string; bbox: { x0: number; y0: number; x1: number; y1: number }; confidence?: number }>; engine: string; confidence: number }
 
+async function tryGoogleVisionOCR(canvas: HTMLCanvasElement): Promise<string | null> {
+  try {
+    const dataUrl = canvas.toDataURL('image/png')
+    const b64 = dataUrl.split(',')[1]
+    if (!b64) return null
+    const res = await fetch('/api/vision-ocr', {
+      method: 'POST',
+      headers: { 'content-type': 'application/json' },
+      body: JSON.stringify({ imageBase64: b64, mimeType: 'image/png' }),
+      signal: AbortSignal.timeout(15000) as any,
+    } as any)
+    if (!res.ok) return null
+    const j: any = await res.json()
+    const t = String(j.text || '').trim()
+    return t.length > 10 ? t : null
+  } catch {
+    return null
+  }
+}
+
 async function recognizeCombined(canvas: HTMLCanvasElement, pageLabel: string, onProgress?: (p: number, m: string) => void): Promise<CombinedOCRResult> {
+  // Try Google Vision first (gemma-4-26b-a4b-it has vision) in parallel with Tesseract for bbox
   const worker: any = await (createWorker as any)('eng', 1)
-  const tResult: any = await worker.recognize(canvas)
+  const tPromise = worker.recognize(canvas) as Promise<any>
+  const gPromise = tryGoogleVisionOCR(canvas)
+
+  const tResult: any = await tPromise
   const tData = tResult.data as { text: string; confidence: number; words?: Array<{ text: string; bbox: { x0: number; y0: number; x1: number; y1: number }; confidence: number }> }
   const tText = String(tData.text || '').trim()
   const tWords = (tData.words || []) as Array<{ text: string; bbox: { x0: number; y0: number; x1: number; y1: number }; confidence: number }>
   const tConf = typeof tData.confidence === 'number' ? tData.confidence : (tWords.length ? tWords.reduce((s, w) => s + (w.confidence || 0), 0) / tWords.length : 0)
+
+  // Await Google vision (with timeout already)
+  let gText: string | null = null
+  try { gText = await gPromise } catch { gText = null }
+
+  // If Google vision gave strong result, prefer it for text (handwriting), keep Tesseract words for bbox
+  if (gText && gText.length > 30) {
+    const useGoogle = gText.length > tText.length * 1.1 || tConf < 65 || tText.length < 40
+    if (useGoogle) {
+      await worker.terminate()
+      // Keep Tesseract words for segmentation if we have them, else synthesize from Google text
+      let finalWords: any[] = tWords
+      if (tWords.length < 6) {
+        const toks = gText.split(/\s+/).filter(Boolean).slice(0, 80)
+        const cols = 8
+        const rowH = canvas.height / Math.max(1, Math.ceil(toks.length / cols))
+        finalWords = toks.map((tok: string, i: number) => {
+          const col = i % cols
+          const row = Math.floor(i / cols)
+          const x0 = (col / cols) * canvas.width
+          const y0 = row * rowH
+          const x1 = x0 + Math.max(40, tok.length * 8)
+          const y1 = y0 + rowH * 0.6
+          return { text: tok, bbox: { x0, y0, x1: Math.min(x1, canvas.width), y1: Math.min(y1, canvas.height) }, confidence: 78 }
+        })
+      }
+      return { text: gText, words: finalWords, engine: 'google-vision', confidence: Math.max(tConf, 80) }
+    }
+    // Otherwise merge Google text as supplement if it adds new content
+    if (gText.length > 40) {
+      const tSet = new Set(tText.toLowerCase().split(/\s+/))
+      const extra = gText.split(/\s+/).filter((w: string) => !tSet.has(w.toLowerCase())).join(' ').trim()
+      if (extra.length > 20) {
+        await worker.terminate()
+        return { text: tText + ' ' + gText, words: tWords, engine: 'combined-google', confidence: Math.max(tConf, 75) }
+      }
+    }
+  }
 
   if (tText.length > 60 && tConf > 68 && tWords.length > 8) {
     await worker.terminate()
@@ -97,10 +159,13 @@ async function recognizeCombined(canvas: HTMLCanvasElement, pageLabel: string, o
       const useTrOCR = tConf < 62 || trocrText.length > tText.length * 1.15 || (tText.length < 30 && trocrText.length > 30)
       if (useTrOCR) {
         finalText = trocrText
+        // If we already have Google text, combine all three
+        if (gText && gText.length > 30 && !finalText.includes(gText.slice(0, 20))) finalText = gText + ' ' + trocrText
+        else if (gText && gText.length > 30) finalText = gText
         engine = tConf < 50 ? 'trocr' : 'combined'
         finalConf = Math.max(tConf, 72)
         if (tWords.length < 6) {
-          const toks = trocrText.split(/\s+/).filter(Boolean).slice(0, 80)
+          const toks = finalText.split(/\s+/).filter(Boolean).slice(0, 80)
           const cols = 8
           const rowH = canvas.height / Math.max(1, Math.ceil(toks.length / cols))
           finalWords = toks.map((tok: string, i: number) => {
@@ -116,14 +181,20 @@ async function recognizeCombined(canvas: HTMLCanvasElement, pageLabel: string, o
       } else if (trocrText.length > 40) {
         const tSet = new Set(tText.toLowerCase().split(/\s+/))
         const extra = trocrText.split(/\s+/).filter((w: string) => !tSet.has(w.toLowerCase())).join(' ').trim()
-        if (extra.length > 20) { finalText = tText + ' ' + trocrText; engine = 'combined' }
+        if (extra.length > 20) { finalText = tText + ' ' + trocrText; if (gText) finalText += ' ' + gText; engine = 'combined' }
       }
+    } else if (gText && gText.length > 30) {
+      finalText = gText
+      engine = 'google-vision'
+      finalConf = 80
     }
     await worker.terminate()
     return { text: finalText, words: finalWords, engine, confidence: finalConf }
   } catch (e) {
     console.warn('[OCR] TrOCR fallback failed, using Tesseract', e)
     await worker.terminate()
+    // If Google gave text, use it as last resort
+    if (gText && gText.length > 30) return { text: gText, words: tWords.length ? tWords : [], engine: 'google-vision', confidence: 80 }
     return { text: tText, words: tWords, engine: 'tesseract', confidence: tConf }
   }
 }

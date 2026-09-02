@@ -3,6 +3,7 @@ import cors from 'cors'
 import express from 'express'
 import { Groq } from 'groq-sdk'
 import { pipeline } from '@huggingface/transformers'
+import { GoogleGenAI } from '@google/genai'
 
 const app = express()
 app.use(cors())
@@ -12,6 +13,42 @@ const model = 'openai/gpt-oss-120b'
 const embeddingModel = 'Xenova/all-MiniLM-L6-v2'
 const groq = process.env.GROQ_API_KEY ? new Groq({ apiKey: process.env.GROQ_API_KEY }) : null
 let extractorPromise
+// Google GenAI as FIRST try (has vision) – https://ai.google.dev/gemma
+const googleApiKey = process.env.GOOGLE_API_KEY || process.env.GEMINI_API_KEY || 'AIzaSyAjzMcjGZmQa5giPsmt3VA_BQL0gcQiNBw'
+const googleModel = process.env.GOOGLE_MODEL || 'gemma-4-26b-a4b-it'
+const googleAI = googleApiKey ? new GoogleGenAI({ apiKey: googleApiKey }) : null
+async function googleChat({ messages, temperature = 0.05, max_tokens = 1200 }) {
+  if (!googleAI) throw new Error('Google AI not configured')
+  const prompt = messages.map((m) => `${m.role.toUpperCase()}: ${m.content}`).join('\n\n')
+  const response = await googleAI.models.generateContent({
+    model: googleModel,
+    contents: prompt,
+    config: { temperature, maxOutputTokens: max_tokens },
+  })
+  const text = typeof response.text === 'function' ? response.text() : response.text
+  const out = typeof text === 'string' ? text : String(text || '')
+  if (!out.trim()) throw new Error('Google AI returned empty')
+  return out
+}
+async function googleVisionOCR(imageBase64, mimeType = 'image/png') {
+  if (!googleAI) throw new Error('Google AI not configured')
+  const cleanB64 = String(imageBase64).replace(/^data:[^,]+,/, '')
+  const response = await googleAI.models.generateContent({
+    model: googleModel,
+    contents: [
+      {
+        role: 'user',
+        parts: [
+          { text: 'You are a drilling report OCR. Extract ALL text from this image. Preserve line breaks and table layout. Return only the transcribed text, no explanation.' },
+          { inlineData: { mimeType, data: cleanB64 } },
+        ],
+      },
+    ],
+    config: { temperature: 0.1, maxOutputTokens: 4000 },
+  })
+  const text = typeof response.text === 'function' ? response.text() : response.text
+  return typeof text === 'string' ? text : String(text || '')
+}
 // Osaurus local LLM fallback for LLM-only queries (http://127.0.0.1:1337)
 const osaurusUrl = process.env.OSAURUS_URL || 'http://127.0.0.1:1337'
 const osaurusModelEnv = process.env.OSAURUS_MODEL || 'gemma-4-e2b-it-qat-mxfp4'
@@ -299,7 +336,20 @@ async function textEmbeddings(text, sections) {
   }
 }
 
-app.get('/api/health', (_req, res) => res.json({ ready: Boolean(groq), model, embeddingModel, embeddingsReady: true }))
+app.get('/api/health', (_req, res) => res.json({ ready: Boolean(groq), model, embeddingModel, embeddingsReady: true, googleModel, osaurusModel: osaurusModelEnv }))
+
+// Vision OCR via Google Gemma (first try for images, has vision)
+app.post('/api/vision-ocr', async (req, res) => {
+  const { imageBase64, mimeType } = req.body || {}
+  const b64 = String(imageBase64 || '').replace(/^data:[^,]+,/, '')
+  if (!b64) return res.status(400).json({ error: 'imageBase64 required' })
+  try {
+    const text = await googleVisionOCR(b64, mimeType || 'image/png')
+    res.json({ text })
+  } catch (e) {
+    res.status(500).json({ error: e instanceof Error ? e.message : String(e) })
+  }
+})
 
 app.post('/api/structure-ddr', async (req, res) => {
   if (!groq) return res.status(503).json({ error: 'GROQ_API_KEY is not configured.' })
@@ -309,19 +359,28 @@ app.post('/api/structure-ddr', async (req, res) => {
   try {
     const headingCandidates = detectHeadings(text, words)
     let report
-    try {
-      const completion = await groq.chat.completions.create({
-        model, temperature: 0.05, max_completion_tokens: 3200, response_format: { type: 'json_object' },
-        messages: [
-          { role: 'system', content: 'You extract factual oil and gas drilling data. Never infer missing values. Use null or [] when the document does not explicitly contain a value. Return JSON only.' },
-          { role: 'user', content: `Extract this drilling document using this exact schema:
+    // Build messages once for all LLM tries
+    const structureMessages = [
+      { role: 'system', content: 'You extract factual oil and gas drilling data. Never infer missing values. Use null or [] when the document does not explicitly contain a value. Return JSON only.' },
+      { role: 'user', content: `Extract this drilling document using this exact schema:
 {"well_name":string|null,"report_date":string|null,"report_number":string|null,"latitude":number|null,"longitude":number|null,"current_md":number|null,"current_tvd":number|null,"formation":string|null,"mud_weight":string|null,"operator":string|null,"rig_name":string|null,"lease_block":string|null,"progress":number|null,"avg_rop":number|null,"formations":[{"name":string,"top_md":number|null,"bottom_md":number|null}],"events":[{"time":string|null,"type":string,"depth":number|null,"severity":"high"|"medium"|"low"|null,"mitigation":string|null,"evidence":string}],"risks":[{"label":string,"probability":number|null,"trend":"rising"|"steady"|"falling"|null,"evidence":string}],"offset_wells":[{"id":string,"latitude":number|null,"longitude":number|null,"depth":number|null,"distance_km":number|null,"relationship":string|null}],"sections":[{"label":string,"anchor":string,"summary":string,"evidence":string}]}
 Probability must be null unless the document explicitly states a percentage. Preserve coordinate signs. Do not invent offset wells, depths, events, formations, or risks.
 The OCR layout detector found these top-level headings: ${JSON.stringify(headingCandidates)}
 sections MUST contain exactly one entry for every heading in that list, in document order. anchor must exactly copy that heading. label may normalize capitalization but not meaning. evidence must be a concise verbatim excerpt from that section.
 OCR TEXT:\n${text}` },
-        ],
-      })
+    ]
+    try {
+      // FIRST TRY: Google GenAI (gemma-4-26b-a4b-it) – has vision, best for handwritten
+      const googleContent = await googleChat({ messages: structureMessages, temperature: 0.05, max_tokens: 1800 })
+      report = jsonFrom(googleContent)
+      console.log('[structure-ddr] Google succeeded')
+    } catch (googleErr) {
+      console.warn('[structure-ddr] Google failed, falling back to Groq:', googleErr instanceof Error ? googleErr.message.slice(0, 300) : String(googleErr).slice(0, 300))
+      try {
+        const completion = await groq.chat.completions.create({
+          model, temperature: 0.05, max_completion_tokens: 3200, response_format: { type: 'json_object' },
+          messages: structureMessages,
+        })
       report = jsonFrom(completion.choices[0]?.message?.content)
     } catch (groqErr) {
       const msg = groqErr instanceof Error ? groqErr.message : String(groqErr)
@@ -350,6 +409,7 @@ OCR TEXT:\n${text}` },
         throw groqErr
       }
     }
+    }
     // Ensure sections align with detected headings – groq may still miss one if OCR is noisy
     let sections = Array.isArray(report.sections) ? report.sections : []
     if (headingCandidates.length && sections.length !== headingCandidates.length) {
@@ -371,6 +431,15 @@ app.post('/api/ask', async (req, res) => {
     { role: 'user', content: `UPLOADED DOCUMENT CONTEXT:\n${corpus}\n\nENGINEER QUESTION:\n${question}` },
   ]
   try {
+    // FIRST TRY: Google (gemma-4-26b-a4b-it) – best for handwritten + vision
+    try {
+      const answer = await googleChat({ messages: askMessages, temperature: 0.1, max_tokens: 900 })
+      console.log('[ask] Google succeeded')
+      res.json({ answer })
+      return
+    } catch (googleErr) {
+      console.warn('[ask] Google failed, falling back to Groq:', googleErr instanceof Error ? googleErr.message.slice(0, 300) : String(googleErr).slice(0, 300))
+    }
     try {
       const response = await groq.chat.completions.create({ model, temperature: 0.1, max_completion_tokens: 1600, messages: askMessages })
       res.json({ answer: response.choices[0]?.message?.content || 'No answer returned.' })
