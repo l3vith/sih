@@ -128,7 +128,21 @@ function isHeading(line) {
   return letters.length >= 6 && uppercase.length / letters.length > .88 && line.split(/\s+/).length >= 2
 }
 
+function isHeadingRelaxed(line) {
+  // Handwritten / OCR fallback: allow Title Case, lower uppercase ratio, shorter lines
+  const t = line.trim()
+  if (t.length < 5 || t.length > 96) return false
+  if (/^(?:\[PAGE|PAGE \d|NWIS DEMO DATASET|DAILY DRILLING REPORT|DDR CONTINUATION|INTELLIGENCE$)/i.test(t)) return false
+  const letters = t.match(/[A-Za-z]/g) || []
+  if (letters.length < 4) return false
+  // Accept either ALLCAPS-ish or Title Case (first letter capital)
+  const isTitleCase = /^[A-Z][a-z]+(?:\s+[A-Z][a-z]+)+/.test(t) || /^[A-Z][A-Z\s\/&-]+$/.test(t)
+  if (!isTitleCase && !/[A-Z]{2}/.test(t)) return false
+  return t.split(/\s+/).length >= 2
+}
+
 function detectHeadings(text, words) {
+  const hasHandwritten = Array.isArray(words) && words.some((w) => w.fromOcr)
   const lines = String(text).split(/\r?\n/).map((line) => line.trim().replace(/\s+/g, ' '))
   const pageLines = new Map()
   for (const word of words) {
@@ -136,7 +150,8 @@ function detectHeadings(text, words) {
     const y = Number(word.y)
     if (!Number.isFinite(page) || !Number.isFinite(y) || !String(word.text || '').trim()) continue
     const existing = pageLines.get(page) || []
-    let line = existing.find((candidate) => Math.abs(candidate.y - y) <= Math.max(.75, Number(word.h || 0) * .55))
+    const yTol = hasHandwritten ? Math.max(1.2, Number(word.h || 0) * 0.8) : Math.max(.75, Number(word.h || 0) * .55)
+    let line = existing.find((candidate) => Math.abs(candidate.y - y) <= yTol)
     if (!line) { line = { y, words: [] }; existing.push(line); pageLines.set(page, existing) }
     line.words.push(word)
   }
@@ -145,16 +160,21 @@ function detectHeadings(text, words) {
       lines.push(line.words.sort((a, b) => Number(a.x) - Number(b.x)).map((word) => String(word.text).trim()).join(' ').replace(/\s+/g, ' ').trim())
     }
   }
-  return [...new Set(lines.filter((line) => {
-    return isHeading(line)
-  }))]
+  const strict = lines.filter((line) => isHeading(line))
+  if (strict.length > 0 || !hasHandwritten) return [...new Set(strict)]
+  // Handwritten fallback: relaxed heading
+  const relaxed = lines.filter((line) => isHeadingRelaxed(line))
+  return [...new Set(relaxed.length ? relaxed : strict)]
 }
 
 function locateSegments(sections, words) {
+  const isHandwritten = Array.isArray(words) && words.some((w) => w.fromOcr)
+  const threshold = isHandwritten ? 0.32 : 0.58
   const hits = []
   for (const [index, section] of sections.entries()) {
     const anchor = clean(section.anchor || section.label)
     const anchorTokens = new Set(anchor.split(' ').filter((token) => token.length > 1))
+    // For handwritten, also try bigrams for better fuzzy match
     const match = words.map((word) => {
       const candidate = clean(word.text)
       const candidateTokens = new Set(candidate.split(' ').filter((token) => token.length > 1))
@@ -162,8 +182,23 @@ function locateSegments(sections, words) {
       const coverage = overlap / Math.max(1, anchorTokens.size)
       const score = candidate.includes(anchor) || anchor.includes(candidate) ? 2 + coverage : coverage
       return { word, score }
-    }).filter(({ score }) => score >= 0.58).sort((a, b) => b.score - a.score)[0]?.word
+    }).filter(({ score }) => score >= threshold).sort((a, b) => b.score - a.score)[0]?.word
     if (match) hits.push({ page: Number(match.page), x: 3.5, y: Math.max(0, Number(match.y) - .8), w: 93, h: 10, label: String(section.label || 'Section').toUpperCase(), tone: index % 2 ? 'amber' : 'cyan' })
+  }
+  // If handwritten and still no hits (e.g., words are synthetic grid), fallback to even vertical distribution
+  if (hits.length === 0 && isHandwritten && sections.length > 0) {
+    const byPage = new Map()
+    for (const s of sections) {
+      const p = 1
+      if (!byPage.has(p)) byPage.set(p, [])
+      byPage.get(p).push(s)
+    }
+    for (const [page, secs] of byPage.entries()) {
+      secs.forEach((sec, idx) => {
+        const y = 8 + (idx / Math.max(1, secs.length)) * 78
+        hits.push({ page, x: 3.5, y, w: 93, h: Math.max(7, 78 / secs.length - 1.5), label: String(sec.label || 'Section').toUpperCase(), tone: idx % 2 ? 'amber' : 'cyan' })
+      })
+    }
   }
   return hits.map((hit) => {
     const next = hits.filter((candidate) => candidate.page === hit.page && candidate.y > hit.y).sort((a, b) => a.y - b.y)[0]

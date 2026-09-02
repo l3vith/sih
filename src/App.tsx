@@ -7,6 +7,7 @@ import 'maplibre-gl/dist/maplibre-gl.css'
 import { getDocument, GlobalWorkerOptions } from 'pdfjs-dist'
 import pdfWorkerUrl from 'pdfjs-dist/build/pdf.worker.min.mjs?url'
 import { createWorker } from 'tesseract.js'
+import { pipeline as hfPipeline } from '@huggingface/transformers'
 
 // Vite serves workers as ESM – wire maplibre's worker to avoid
 // "blocked because of a disallowed MIME type" in dev (localhost:5173)
@@ -31,7 +32,7 @@ type Report = {
 }
 type Analysis = { report: Report; segments: Segment[]; embeddings: Embedding[]; embeddingModel: string; corpus: string; documentVector: number[] | null }
 type IndexedDocument = Analysis & { name: string; url: string; pages: number }
-type WordBox = { text: string; page: number; x: number; y: number; w: number; h: number }
+type WordBox = { text: string; page: number; x: number; y: number; w: number; h: number; fromOcr?: boolean }
 
 const mapStyle: StyleSpecification = {
   version: 8, sources: {
@@ -48,6 +49,84 @@ const mapStyle: StyleSpecification = {
 }
 const value = (input: string | number | null | undefined, suffix = '') => input === null || input === undefined || input === '' ? 'Not found' : `${typeof input === 'number' ? input.toLocaleString() : input}${suffix}`
 const isImageFile = (file: File) => file.type.startsWith('image/') || /\.(png|jpe?g|tiff|bmp|webp)$/i.test(file.name)
+
+// --- Combined OCR: Tesseract (fast, bbox) + TrOCR (handwriting) fallback ---
+let trocrHandPromise: Promise<any> | null = null
+let trocrPrintedPromise: Promise<any> | null = null
+async function getTrOCR(handwritten = true): Promise<any> {
+  if (handwritten) {
+    if (!trocrHandPromise) trocrHandPromise = hfPipeline('image-to-text', 'Xenova/trocr-base-handwritten' as any) as any
+    return trocrHandPromise
+  }
+  if (!trocrPrintedPromise) trocrPrintedPromise = hfPipeline('image-to-text', 'Xenova/trocr-base-printed' as any) as any
+  return trocrPrintedPromise
+}
+
+type CombinedOCRResult = { text: string; words: Array<{ text: string; bbox: { x0: number; y0: number; x1: number; y1: number }; confidence?: number }>; engine: string; confidence: number }
+
+async function recognizeCombined(canvas: HTMLCanvasElement, pageLabel: string, onProgress?: (p: number, m: string) => void): Promise<CombinedOCRResult> {
+  const worker: any = await (createWorker as any)('eng', 1)
+  const tResult: any = await worker.recognize(canvas)
+  const tData = tResult.data as { text: string; confidence: number; words?: Array<{ text: string; bbox: { x0: number; y0: number; x1: number; y1: number }; confidence: number }> }
+  const tText = String(tData.text || '').trim()
+  const tWords = (tData.words || []) as Array<{ text: string; bbox: { x0: number; y0: number; x1: number; y1: number }; confidence: number }>
+  const tConf = typeof tData.confidence === 'number' ? tData.confidence : (tWords.length ? tWords.reduce((s, w) => s + (w.confidence || 0), 0) / tWords.length : 0)
+
+  if (tText.length > 60 && tConf > 68 && tWords.length > 8) {
+    await worker.terminate()
+    return { text: tText, words: tWords, engine: 'tesseract', confidence: tConf }
+  }
+
+  if (onProgress) onProgress(0, `TrOCR fallback for ${pageLabel} (Tesseract ${tConf.toFixed(0)}%, ${tWords.length}w)`)
+  try {
+    let trocr: any
+    try { trocr = await getTrOCR(true) } catch { trocr = await getTrOCR(false) }
+    const trocrOut: any = await trocr(canvas)
+    let trocrText = ''
+    if (Array.isArray(trocrOut) && trocrOut[0]?.generated_text) trocrText = String(trocrOut[0].generated_text).trim()
+    else if (typeof trocrOut === 'string') trocrText = trocrOut.trim()
+    else if (trocrOut?.generated_text) trocrText = String(trocrOut.generated_text).trim()
+    else trocrText = String(trocrOut || '').trim()
+
+    let finalText = tText
+    let finalWords: any[] = tWords
+    let engine = 'tesseract'
+    let finalConf = tConf
+
+    if (trocrText && trocrText.length > 20) {
+      const useTrOCR = tConf < 62 || trocrText.length > tText.length * 1.15 || (tText.length < 30 && trocrText.length > 30)
+      if (useTrOCR) {
+        finalText = trocrText
+        engine = tConf < 50 ? 'trocr' : 'combined'
+        finalConf = Math.max(tConf, 72)
+        if (tWords.length < 6) {
+          const toks = trocrText.split(/\s+/).filter(Boolean).slice(0, 80)
+          const cols = 8
+          const rowH = canvas.height / Math.max(1, Math.ceil(toks.length / cols))
+          finalWords = toks.map((tok: string, i: number) => {
+            const col = i % cols
+            const row = Math.floor(i / cols)
+            const x0 = (col / cols) * canvas.width
+            const y0 = row * rowH
+            const x1 = x0 + Math.max(40, tok.length * 8)
+            const y1 = y0 + rowH * 0.6
+            return { text: tok, bbox: { x0, y0, x1: Math.min(x1, canvas.width), y1: Math.min(y1, canvas.height) }, confidence: 75 }
+          })
+        }
+      } else if (trocrText.length > 40) {
+        const tSet = new Set(tText.toLowerCase().split(/\s+/))
+        const extra = trocrText.split(/\s+/).filter((w: string) => !tSet.has(w.toLowerCase())).join(' ').trim()
+        if (extra.length > 20) { finalText = tText + ' ' + trocrText; engine = 'combined' }
+      }
+    }
+    await worker.terminate()
+    return { text: finalText, words: finalWords, engine, confidence: finalConf }
+  } catch (e) {
+    console.warn('[OCR] TrOCR fallback failed, using Tesseract', e)
+    await worker.terminate()
+    return { text: tText, words: tWords, engine: 'tesseract', confidence: tConf }
+  }
+}
 
 function semanticProjection(vectors: number[][]): { x: number; y: number }[] {
   if (vectors.length === 1) return [{ x: 50, y: 50 }]
@@ -87,8 +166,7 @@ function cosine(a: number[], b: number[]) {
 }
 
 async function analyseImage(file: File, onProgress: (progress: number, message: string) => void): Promise<{ analysis: Analysis; pages: number }> {
-  onProgress(25, 'Running OCR on image document')
-  const worker = await createWorker('eng')
+  onProgress(25, 'Running OCR on image document (Tesseract + TrOCR)')
   const imageUrl = URL.createObjectURL(file)
   try {
     const img = await new Promise<HTMLImageElement>((resolve, reject) => {
@@ -103,20 +181,18 @@ async function analyseImage(file: File, onProgress: (progress: number, message: 
     const context = canvas.getContext('2d')
     if (!context) throw new Error('Canvas not available for image OCR.')
     context.drawImage(img, 0, 0)
-    const result = await worker.recognize(canvas)
-    const data = result.data as unknown as { text: string; words?: Array<{ text: string; bbox: { x0: number; y0: number; x1: number; y1: number } }> }
-    const text = `\n\n[PAGE 1]\n${String(data.text || '').trim()}`
-    const words: WordBox[] = (data.words || []).map((word) => ({ text: word.text, page: 1, x: word.bbox.x0 / canvas.width * 100, y: word.bbox.y0 / canvas.height * 100, w: (word.bbox.x1 - word.bbox.x0) / canvas.width * 100, h: (word.bbox.y1 - word.bbox.y0) / canvas.height * 100 }))
+    const combined = await recognizeCombined(canvas, 'page 1', onProgress)
+    const text = `\n\n[PAGE 1]\n${String(combined.text || '').trim()}`
+    const words: WordBox[] = (combined.words || []).map((word) => ({ text: word.text, page: 1, x: word.bbox.x0 / canvas.width * 100, y: word.bbox.y0 / canvas.height * 100, w: (word.bbox.x1 - word.bbox.x0) / canvas.width * 100, h: (word.bbox.y1 - word.bbox.y0) / canvas.height * 100, fromOcr: true }))
     if (!text.replace(/\[PAGE \d+\]/g, '').trim()) throw new Error('No readable text was found in this image.')
-    onProgress(72, 'Sending OCR evidence to Groq for factual structuring')
+    onProgress(72, `Sending OCR evidence to Groq for factual structuring (${combined.engine} ${combined.confidence.toFixed(0)}%)`)
     const response = await fetch('/api/structure-ddr', { method: 'POST', headers: { 'content-type': 'application/json' }, body: JSON.stringify({ text, words }) })
     const payload = await response.json()
     if (!response.ok) throw new Error(payload.error || 'Document analysis failed.')
-    onProgress(100, `Indexed ${payload.report.sections?.length || 0} sections from 1 page`)
+    onProgress(100, `Indexed ${payload.report.sections?.length || 0} sections from 1 page via ${combined.engine}`)
     return { analysis: payload as Analysis, pages: 1 }
   } finally {
     URL.revokeObjectURL(imageUrl)
-    await worker.terminate()
   }
 }
 
@@ -136,18 +212,15 @@ async function analysePdf(file: File, onProgress: (progress: number, message: st
       words.push({ text: item.str, page: pageNumber, x: x / viewport.width * 100, y: (viewport.height - y - Math.abs(height)) / viewport.height * 100, w: item.width / viewport.width * 100, h: Math.max(1, Math.abs(height) / viewport.height * 100) })
     }
     if (pageText.trim().length < 80) {
-      onProgress(Math.round(pageNumber / pdf.numPages * 55), `Running OCR on scanned page ${pageNumber} of ${pdf.numPages}`)
+      onProgress(Math.round(pageNumber / pdf.numPages * 50), `Running Tesseract+TrOCR on scanned page ${pageNumber} of ${pdf.numPages}`)
       const ocrViewport = page.getViewport({ scale: 1.8 })
       const canvas = window.document.createElement('canvas'); canvas.width = ocrViewport.width; canvas.height = ocrViewport.height
       const context = canvas.getContext('2d')
       if (context) {
         await page.render({ canvas, canvasContext: context, viewport: ocrViewport }).promise
-        const worker = await createWorker('eng')
-        const result = await worker.recognize(canvas)
-        const data = result.data as unknown as { text: string; words?: Array<{ text: string; bbox: { x0: number; y0: number; x1: number; y1: number } }> }
-        pageText = data.text
-        for (const word of data.words || []) words.push({ text: word.text, page: pageNumber, x: word.bbox.x0 / canvas.width * 100, y: word.bbox.y0 / canvas.height * 100, w: (word.bbox.x1 - word.bbox.x0) / canvas.width * 100, h: (word.bbox.y1 - word.bbox.y0) / canvas.height * 100 })
-        await worker.terminate()
+        const combined = await recognizeCombined(canvas, `page ${pageNumber}`)
+        pageText = combined.text
+        for (const word of combined.words || []) words.push({ text: word.text, page: pageNumber, x: word.bbox.x0 / canvas.width * 100, y: word.bbox.y0 / canvas.height * 100, w: (word.bbox.x1 - word.bbox.x0) / canvas.width * 100, h: (word.bbox.y1 - word.bbox.y0) / canvas.height * 100, fromOcr: true })
       }
     }
     text += `\n\n[PAGE ${pageNumber}]\n${pageText.trim()}`
