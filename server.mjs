@@ -14,10 +14,13 @@ const groq = process.env.GROQ_API_KEY ? new Groq({ apiKey: process.env.GROQ_API_
 let extractorPromise
 // Osaurus local LLM fallback for LLM-only queries (http://127.0.0.1:1337)
 const osaurusUrl = process.env.OSAURUS_URL || 'http://127.0.0.1:1337'
-const osaurusModelEnv = process.env.OSAURUS_MODEL || 'gemma-4-e2b-it-8bit'
+const osaurusModelEnv = process.env.OSAURUS_MODEL || 'gemma-4-e2b-it-qat-mxfp4'
 let cachedOsaurusModel = null
 async function getOsaurusModel() {
   if (cachedOsaurusModel) return cachedOsaurusModel
+  // Respect explicit requested id (qat-mxfp4) directly – don't auto-discover 8bit
+  if (osaurusModelEnv === 'gemma-4-e2b-it-qat-mxfp4') { cachedOsaurusModel = osaurusModelEnv; return cachedOsaurusModel }
+  if (process.env.OSAURUS_MODEL) { cachedOsaurusModel = process.env.OSAURUS_MODEL; return cachedOsaurusModel }
   try {
     const r = await fetch(`${osaurusUrl}/models`, { signal: AbortSignal.timeout(3000) })
     if (r.ok) {
@@ -41,8 +44,8 @@ async function osaurusChat({ messages, temperature = 0.05, max_tokens = 1200, re
   const mdl = await getOsaurusModel()
   // Osaurus gemma with response_format:json_object is strict and can 400 on truncation – omit for fallback and rely on jsonFrom repair
   const body = { model: mdl, messages, temperature, max_tokens }
-  // only pass response_format if caller explicitly wants it and model is not gemma fallback
-  if (response_format && mdl !== 'gemma-4-e2b-it-8bit') body.response_format = response_format
+  // only pass response_format if caller explicitly wants it and model is not gemma fallback (qAT/mxfp4 is also gemma)
+  if (response_format && !mdl.includes('gemma-4-e2b')) body.response_format = response_format
   const res = await fetch(`${osaurusUrl}/chat/completions`, { method: 'POST', headers: { 'content-type': 'application/json' }, body: JSON.stringify(body), signal: AbortSignal.timeout(120000) })
   if (!res.ok) throw new Error(`Osaurus ${res.status}: ${await res.text().then((t) => t.slice(0, 800))}`)
   const data = await res.json()
