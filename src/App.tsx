@@ -243,8 +243,42 @@ function DepthPanel({ report }: { report: Report }) {
 }
 
 function StreamPanel({ document, status }: { document: IndexedDocument; status: string }) {
-  const items = [{ title: 'PDF + OCR extraction', detail: status, icon: <FileText size={15} />, tone: 'cyan' }, ...document.report.sections.slice(0, 2).map((section) => ({ title: section.label, detail: section.summary || 'Section indexed', icon: <Database size={15} />, tone: 'cyan' })), ...document.report.events.slice(0, 2).map((event) => ({ title: event.type, detail: `${event.depth === null ? 'Depth not stated' : `${event.depth.toLocaleString()} m`} · ${event.evidence}`, icon: <AlertTriangle size={15} />, tone: 'amber' }))]
-  return <><PanelHeader icon={<Zap size={16} />} title="LIVE PARSING STREAM" meta="DOCUMENT PIPELINE" /><div className="stream-list">{items.map((item, index) => <div className="stream-item" key={`${item.title}-${index}`}><time>NOW</time><span className={`stream-icon ${item.tone}`}>{item.icon}</span><div><strong>{item.title}</strong><span>{item.detail}</span></div><ArrowUpRight size={13} /></div>)}</div></>
+  const isOrangeSection = (label: string) => {
+    const l = label.toLowerCase()
+    return l.includes('operation') || l.includes('event') || l.includes('fluid') || l.includes('decision') || l.includes('casing') || l.includes('cement') || l.includes('risk')
+  }
+  const sectionItems = document.report.sections.map((section) => ({
+    title: section.label,
+    detail: section.summary || (section.evidence ? section.evidence.slice(0, 110) : 'Section indexed'),
+    icon: <Database size={15} />,
+    tone: isOrangeSection(section.label) ? 'amber' : 'cyan',
+  }))
+  const eventItems = document.report.events.map((event) => ({
+    title: event.type,
+    detail: `${event.time ? event.time + ' · ' : ''}${event.depth === null ? 'Depth not stated' : `${event.depth.toLocaleString()} m`} · ${event.evidence} ${event.severity ? `· ${event.severity}` : ''}`,
+    icon: <AlertTriangle size={15} />,
+    tone: 'amber',
+  }))
+  const riskItems = document.report.risks.map((risk) => ({
+    title: risk.label,
+    detail: `${risk.evidence}${risk.probability !== null ? ` · ${risk.probability}%` : ''} ${risk.trend ? `· ${risk.trend}` : ''}`,
+    icon: <AlertTriangle size={15} />,
+    tone: 'amber',
+  }))
+  const offsetItems = document.report.offset_wells.slice(0, 3).map((well) => ({
+    title: `Offset ${well.id}`,
+    detail: `${well.distance_km !== null ? `${well.distance_km} km` : 'Distance not stated'} · ${well.relationship || 'Nearby well context'}`,
+    icon: <MapPinned size={15} />,
+    tone: 'cyan',
+  }))
+  const items = [
+    { title: 'PDF + OCR extraction', detail: status, icon: <FileText size={15} />, tone: 'cyan' },
+    ...sectionItems,
+    ...eventItems,
+    ...riskItems,
+    ...offsetItems,
+  ]
+  return <><PanelHeader icon={<Zap size={16} />} title="LIVE PARSING STREAM" meta={`${items.length} ITEMS · DOCUMENT PIPELINE`} /><div className="stream-list" style={{ maxHeight: 420, overflowY: 'auto' }}>{items.map((item, index) => <div className="stream-item" key={`${item.title}-${index}`}><time>NOW</time><span className={`stream-icon ${item.tone}`}>{item.icon}</span><div><strong>{item.title}</strong><span>{item.detail}</span></div><ArrowUpRight size={13} /></div>)}</div></>
 }
 
 function RiskRow({ risks, events, openPrediction }: { risks: Risk[]; events: Event[]; openPrediction: () => void }) {
