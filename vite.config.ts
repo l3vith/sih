@@ -3,6 +3,7 @@ import react from '@vitejs/plugin-react'
 
 export default defineConfig({
   plugins: [react()],
+  envPrefix: ['VITE_', 'SUPABASE_'],
   worker: { format: 'es' },
   optimizeDeps: { include: ['maplibre-gl'] },
   server: {

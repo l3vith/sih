@@ -4,6 +4,13 @@ import express from 'express'
 import { Groq } from 'groq-sdk'
 import { pipeline } from '@huggingface/transformers'
 import { GoogleGenAI } from '@google/genai'
+import { createClient } from '@supabase/supabase-js'
+
+const supabaseUrl = process.env.SUPABASE_URL || process.env.VITE_SUPABASE_URL || ''
+const supabaseServiceKey = process.env.SUPABASE_SERVICE_ROLE_KEY || process.env.SUPABASE_ANON_KEY || process.env.VITE_SUPABASE_ANON_KEY || ''
+const supabase = supabaseUrl && supabaseServiceKey ? createClient(supabaseUrl, supabaseServiceKey) : null
+if (supabase) console.log('[supabase] server client initialized')
+else console.log('[supabase] not configured — running in local-only mode')
 
 const app = express()
 app.use(cors())
@@ -336,7 +343,15 @@ async function textEmbeddings(text, sections) {
   }
 }
 
-app.get('/api/health', (_req, res) => res.json({ ready: Boolean(groq), model, embeddingModel, embeddingsReady: true, googleModel, osaurusModel: osaurusModelEnv }))
+app.get('/api/health', (_req, res) => res.json({ ready: Boolean(groq), model, embeddingModel, embeddingsReady: true, googleModel, osaurusModel: osaurusModelEnv, supabase: Boolean(supabase) }))
+app.get('/api/supabase/health', (_req, res) => res.json({ configured: Boolean(supabase), url: supabaseUrl ? supabaseUrl.slice(0, 28) + '...' : null }))
+// Proxy for documents when RLS blocks anon — uses service key
+app.get('/api/supabase/documents', async (_req, res) => {
+  if (!supabase) return res.status(503).json({ error: 'Supabase not configured' })
+  const { data, error } = await supabase.from('documents').select('*').order('created_at', { ascending: false }).limit(50)
+  if (error) return res.status(500).json({ error: error.message })
+  res.json({ data })
+})
 
 // Vision OCR via Google Gemma (first try for images, has vision)
 app.post('/api/vision-ocr', async (req, res) => {
@@ -417,6 +432,34 @@ OCR TEXT:\n${text}` },
     }
     const embeddings = await textEmbeddings(text, sections)
     const documentVector = await getDocumentVector(report, text)
+    // best-effort Supabase persistence (well + document) — client also persists with file name; server keeps well registry
+    if (supabase) {
+      try {
+        if (report?.well_name) {
+          await supabase.from('wells').upsert({
+            well_name: report.well_name,
+            latitude: report.latitude, longitude: report.longitude,
+            current_md: report.current_md, current_tvd: report.current_tvd,
+            formation: report.formation, operator: report.operator,
+            rig_name: report.rig_name, lease_block: report.lease_block,
+            progress: report.progress, avg_rop: report.avg_rop,
+          }, { onConflict: 'well_name' })
+        }
+        const docName = String(req.body?.name || req.body?.fileName || '').slice(0, 120).trim()
+        if (docName) {
+          const vectorJson = documentVector ? documentVector : null
+          await supabase.from('documents').upsert({
+            name: docName,
+            well_name: report?.well_name ?? null,
+            report, corpus: text, embedding_model: embeddingModel,
+            document_vector: null,
+            document_vector_json: vectorJson,
+            segments: locateSegments(sections, words),
+            embeddings, pages: Math.max(1, Math.ceil(String(text).split('[PAGE').length - 1) || 1),
+          }, { onConflict: 'name' })
+        }
+      } catch (e) { console.warn('[supabase] structure-ddr persist', e instanceof Error ? e.message : String(e)) }
+    }
     res.json({ report, segments: locateSegments(sections, words), embeddings, embeddingModel, corpus: text, documentVector })
   } catch (error) { res.status(500).json({ error: error instanceof Error ? error.message : 'Groq structuring failed.' }) }
 })

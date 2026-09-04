@@ -13,6 +13,7 @@
   "dependencies": {
     "@google/genai": "^2.21.0",
     "@huggingface/transformers": "^4.2.0",
+    "@supabase/supabase-js": "^2.115.0",
     "@vitejs/plugin-react": "latest",
     "cors": "^2.8.6",
     "dotenv": "^17.4.2",
