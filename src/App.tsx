@@ -11,6 +11,9 @@ import pdfWorkerUrl from 'pdfjs-dist/build/pdf.worker.min.mjs?url'
 // "blocked because of a disallowed MIME type" in dev (localhost:5173)
 setWorkerUrl(maplibreWorkerUrl)
 import { Activity, AlertTriangle, Anchor, ArrowUpRight, Bell, BrainCircuit, ChevronDown, CircleHelp, Crosshair, Database, FileScan, FileText, Flame, Gauge, MapPinned, LoaderCircle, Maximize2, Menu, Network, PanelLeftClose, Pause, Play, RotateCcw, Search, Send, Settings2, Sparkles, Upload, Waves, X, Zap } from 'lucide-react'
+import { enText, useLang } from './lang'
+import type { StrKey } from './lang'
+import LanguageToggle from './components/LanguageToggle'
 import WellDive from './components/WellDive'
 import { isSupabaseConfigured, loadDocumentsFromSupabase, saveAlert as saveAlertToSupabase, saveDocumentToSupabase, saveTelemetryBatch, supabase, upsertWellFromReport } from './lib/supabase'
 
@@ -47,7 +50,8 @@ const mapStyle: StyleSpecification = {
     { id: 'indian-basemap', type: 'raster', source: 'indian-basemap', paint: { 'raster-opacity': 0.85 } },
   ],
 }
-const value = (input: string | number | null | undefined, suffix = '') => input === null || input === undefined || input === '' ? 'Not found' : `${typeof input === 'number' ? input.toLocaleString() : input}${suffix}`
+const value = (input: string | number | null | undefined, suffix = '', notFound = 'Not found') => input === null || input === undefined || input === '' ? notFound : `${typeof input === 'number' ? input.toLocaleString() : input}${suffix}`
+export class L10nError extends Error { key: StrKey; vars?: Record<string, string | number>; constructor(key: StrKey, vars?: Record<string, string | number>) { super(key); this.key = key; this.vars = vars } }
 const isImageFile = (file: File) => file.type.startsWith('image/') || /\.(png|jpe?g|tiff|bmp|webp)$/i.test(file.name)
 
 // --- Hybrid Search helpers ---
@@ -133,7 +137,7 @@ function computeWhatIfRisks(risks: Risk[], mudDelta: number, flowDelta: number, 
 
 // --- Telemetry Replay + Alert System ---
 type TelemetrySample = { time: string; depth: number; wob: number | null; rop: number | null; rpm: number | null; torque: number | null; spp: number | null; flowIn: number | null; flowOut: number | null; mudWeight: number | null; gas: number | null; hookLoad: number | null; quality: 'good' | 'degraded' | 'missing' }
-type TelemetryAlert = { id: string; time: string; depth: number | null; kind: 'Mud Loss' | 'Kick' | 'Stuck Pipe' | 'Overpressure' | 'Torque Spike'; severity: 'high' | 'medium' | 'low'; message: string; evidence: string; acknowledged: boolean; suppressed: boolean; createdIdx: number }
+type TelemetryAlert = { id: string; time: string; depth: number | null; kind: 'Mud Loss' | 'Kick' | 'Stuck Pipe' | 'Overpressure' | 'Torque Spike'; severity: 'high' | 'medium' | 'low'; messageKey: StrKey; messageVars?: Record<string, string | number>; evidence: string; acknowledged: boolean; suppressed: boolean; createdIdx: number }
 function generateSyntheticTelemetry(report: Report): TelemetrySample[] {
   const endDepth = report.current_md ?? 3200
   const startDepth = Math.max(200, endDepth - 1800)
@@ -192,11 +196,11 @@ function generateSyntheticTelemetry(report: Report): TelemetrySample[] {
 }
 function parseTelemetryCsv(text: string): TelemetrySample[] {
   const lines = String(text).split(/\r?\n/).map(l => l.trim()).filter(Boolean)
-  if (lines.length < 2) throw new Error('CSV needs header + rows')
+  if (lines.length < 2) throw new L10nError('errCsvHeader')
   const header = lines[0].toLowerCase().split(',').map(h => h.trim())
   const idx = (name: string) => header.indexOf(name)
   const hasDepth = idx('depth') !== -1 || idx('md') !== -1
-  if (!hasDepth) throw new Error('CSV header must include depth or md')
+  if (!hasDepth) throw new L10nError('errCsvDepth')
   const get = (row: string[], name: string, alias?: string) => {
     let i = idx(name); if (i === -1 && alias) i = idx(alias); if (i === -1) return null
     const v = row[i]?.trim(); if (!v || v === '--' || v.toLowerCase() === 'null') return null
@@ -225,10 +229,10 @@ function evaluateTelemetryAlerts(sampleWindow: TelemetrySample[], allSamples: Te
   const findOffsetEvidence = (kind: string) => {
     const ev = report.events.find(e => e.type.toLowerCase().includes(kind.toLowerCase().slice(0, 4)))
     const rw = report.risks.find(r => r.label.toLowerCase().includes(kind.toLowerCase().slice(0, 4)))
-    return ev ? `${ev.type} @ ${ev.depth ?? '?'}m: ${ev.evidence.slice(0, 90)}` : rw ? `${rw.label}: ${rw.evidence.slice(0, 90)}` : report.formation ? `Similar hazard noted in ${report.formation} offset wells` : 'No direct offset evidence'
+    return ev ? `${ev.type} @ ${ev.depth ?? '?'}m: ${ev.evidence.slice(0, 90)}` : rw ? `${rw.label}: ${rw.evidence.slice(0, 90)}` : report.formation ? `__SIM__${report.formation}` : '__NONE__'
   }
   const recentSameKind = (kind: TelemetryAlert['kind']) => existing.some(a => a.kind === kind && !a.suppressed && (currentIdx - a.createdIdx) < cooldown)
-  const check = (kind: TelemetryAlert['kind'], severity: TelemetryAlert['severity'], cond: boolean, message: string) => {
+  const check = (kind: TelemetryAlert['kind'], severity: TelemetryAlert['severity'], cond: boolean, messageKey: StrKey, messageVars?: Record<string, string | number>) => {
     if (!cond) return null
     if (recentSameKind(kind)) return null
     const cnt = window.slice(-persistence).every(s => {
@@ -242,14 +246,14 @@ function evaluateTelemetryAlerts(sampleWindow: TelemetrySample[], allSamples: Te
     })
     if (!cnt) return null
     const id = `${kind}-${currentIdx}-${Date.now()}`
-    return { id, time: last.time, depth, kind, severity, message, evidence: findOffsetEvidence(kind), acknowledged: false, suppressed: false, createdIdx: currentIdx } as TelemetryAlert
+    return { id, time: last.time, depth, kind, severity, messageKey, messageVars, evidence: findOffsetEvidence(kind), acknowledged: false, suppressed: false, createdIdx: currentIdx } as TelemetryAlert
   }
   const alerts: TelemetryAlert[] = []
-  const loss = check('Mud Loss', 'high', window.slice(-persistence).every(s => s.flowOut !== null && s.flowIn !== null && s.flowOut! / s.flowIn! < 0.88), `Flow-out ${last.flowOut} < 88% of flow-in ${last.flowIn} for ${persistence} samples`)
-  const kick = check('Kick', 'high', (last.gas ?? 0) > 2.8, `Gas ${last.gas} units above kick threshold (2.8)`)
-  const stuck = check('Stuck Pipe', 'high', (last.torque ?? 0) > 14.5 && (last.wob ?? 0) > 16, `Torque ${last.torque} kNm + WOB ${last.wob} klb — stuck-pipe signature`)
-  const press = check('Overpressure', 'medium', (last.spp ?? 0) > 2150, `SPP ${last.spp} psi sustained — overpressure`)
-  const spike = check('Torque Spike', 'medium', window.length >= 2 && ((last.torque ?? 0) - (window[window.length - 2].torque ?? 0) > 4.5), `Torque spike +${(((last.torque ?? 0) - (window[window.length - 2]?.torque ?? 0)).toFixed(1))} kNm`)
+  const loss = check('Mud Loss', 'high', window.slice(-persistence).every(s => s.flowOut !== null && s.flowIn !== null && s.flowOut! / s.flowIn! < 0.88), 'msgLoss', { out: last.flowOut ?? '—', flow: last.flowIn ?? '—', n: persistence })
+  const kick = check('Kick', 'high', (last.gas ?? 0) > 2.8, 'msgKick', { gas: last.gas ?? '—' })
+  const stuck = check('Stuck Pipe', 'high', (last.torque ?? 0) > 14.5 && (last.wob ?? 0) > 16, 'msgStuck', { torque: last.torque ?? '—', wob: last.wob ?? '—' })
+  const press = check('Overpressure', 'medium', (last.spp ?? 0) > 2150, 'msgOver', { spp: last.spp ?? '—' })
+  const spike = check('Torque Spike', 'medium', window.length >= 2 && ((last.torque ?? 0) - (window[window.length - 2].torque ?? 0) > 4.5), 'msgSpike', { d: (((last.torque ?? 0) - (window[window.length - 2]?.torque ?? 0)).toFixed(1)) })
   for (const a of [loss, kick, stuck, press, spike]) if (a) alerts.push(a)
   return alerts
 }
@@ -261,8 +265,12 @@ async function recognizePage(canvas: HTMLCanvasElement): Promise<OCRResult> {
     body: JSON.stringify({ imageBase64: canvas.toDataURL('image/png') }),
     signal: AbortSignal.timeout(660000),
   })
-  const payload = await response.json().catch(() => ({ error: 'OCR service returned an invalid response. Check that the API server is running.' }))
-  if (!response.ok) throw new Error(payload.error || 'Local GLM-OCR processing failed.')
+  const payload = await response.json().catch(() => ({ error: '__L10N__errOcrBad' }))
+  if (!response.ok) {
+    if (typeof payload.error === 'string' && payload.error.startsWith('__L10N__')) throw new L10nError(payload.error.slice(8) as StrKey)
+    if (payload.error) throw new Error(payload.error)
+    throw new L10nError('errOcrFail')
+  }
   return payload as OCRResult
 }
 
@@ -303,38 +311,42 @@ function cosine(a: number[], b: number[]) {
   return dot / (Math.sqrt(na) * Math.sqrt(nb) || 1)
 }
 
-async function analyseImage(file: File, onProgress: (progress: number, message: string) => void): Promise<{ analysis: Analysis; pages: number }> {
-  onProgress(25, 'Reading page 1 with local GLM-OCR')
+async function analyseImage(file: File, onProgress: (progress: number, key: StrKey, vars?: Record<string, string | number>) => void): Promise<{ analysis: Analysis; pages: number }> {
+  onProgress(25, 'pgReadingImg')
   const imageUrl = URL.createObjectURL(file)
   try {
     const img = await new Promise<HTMLImageElement>((resolve, reject) => {
       const image = new Image()
       image.onload = () => resolve(image)
-      image.onerror = () => reject(new Error('Failed to load image for OCR.'))
+      image.onerror = () => reject(new L10nError('errImgLoad'))
       image.src = imageUrl
     })
     const canvas = window.document.createElement('canvas')
     canvas.width = img.naturalWidth
     canvas.height = img.naturalHeight
     const context = canvas.getContext('2d')
-    if (!context) throw new Error('Canvas not available for image OCR.')
+    if (!context) throw new L10nError('errCanvas')
     context.drawImage(img, 0, 0)
     const combined = await recognizePage(canvas)
     const text = `\n\n[PAGE 1]\n${String(combined.text || '').trim()}`
     const words: WordBox[] = (combined.words || []).map((word) => ({ text: word.text, page: 1, x: word.bbox.x0 / combined.width * 100, y: word.bbox.y0 / combined.height * 100, w: (word.bbox.x1 - word.bbox.x0) / combined.width * 100, h: (word.bbox.y1 - word.bbox.y0) / combined.height * 100, fromOcr: true }))
-    if (!text.replace(/\[PAGE \d+\]/g, '').trim()) throw new Error('No readable text was found in this image.')
-    onProgress(72, `Sending OCR evidence to Groq for factual structuring (${combined.engine})`)
+    if (!text.replace(/\[PAGE \d+\]/g, '').trim()) throw new L10nError('errNoTextImg')
+    onProgress(72, 'structuring', { engine: combined.engine })
     const response = await fetch('/api/structure-ddr', { method: 'POST', headers: { 'content-type': 'application/json' }, body: JSON.stringify({ text, words, name: file.name }) })
     const payload = await response.json()
-    if (!response.ok) throw new Error(payload.error || 'Document analysis failed.')
-    onProgress(95, `Indexed ${payload.report.sections?.length || 0} sections from 1 page via ${combined.engine}`)
+    if (!response.ok) {
+      if (typeof payload.error === 'string' && payload.error.startsWith('__L10N__')) throw new L10nError(payload.error.slice(8) as StrKey)
+      if (payload.error) throw new Error(payload.error)
+      throw new L10nError('errStruct')
+    }
+    onProgress(95, 'indexedMsg', { sections: payload.report.sections?.length || 0, pages: 1 })
     return { analysis: payload as Analysis, pages: 1 }
   } finally {
     URL.revokeObjectURL(imageUrl)
   }
 }
 
-async function analysePdf(file: File, onProgress: (progress: number, message: string) => void) {
+async function analysePdf(file: File, onProgress: (progress: number, key: StrKey, vars?: Record<string, string | number>) => void) {
   const loadingTask = getDocument({ data: await file.arrayBuffer() })
   const pdf = await loadingTask.promise
   try {
@@ -342,12 +354,12 @@ async function analysePdf(file: File, onProgress: (progress: number, message: st
   const words: WordBox[] = []
   for (let pageNumber = 1; pageNumber <= pdf.numPages; pageNumber += 1) {
     const page = await pdf.getPage(pageNumber)
-    onProgress(Math.round((pageNumber - 1) / pdf.numPages * 65) + 5, `Reading page ${pageNumber} of ${pdf.numPages} with local GLM-OCR`)
+    onProgress(Math.round((pageNumber - 1) / pdf.numPages * 65) + 5, 'pgReadingPdf', { p: pageNumber, n: pdf.numPages })
     const viewport = page.getViewport({ scale: 1.8 })
     const canvas = window.document.createElement('canvas')
     canvas.width = viewport.width; canvas.height = viewport.height
     const context = canvas.getContext('2d')
-    if (!context) throw new Error('Canvas not available for document OCR.')
+    if (!context) throw new L10nError('errCanvas')
     await page.render({ canvas, canvasContext: context, viewport }).promise
     const combined = await recognizePage(canvas)
     const pageText = combined.text
@@ -355,22 +367,26 @@ async function analysePdf(file: File, onProgress: (progress: number, message: st
     canvas.width = 0; canvas.height = 0
     page.cleanup()
     text += `\n\n[PAGE ${pageNumber}]\n${pageText.trim()}`
-    onProgress(Math.round(pageNumber / pdf.numPages * 65), `Extracted page ${pageNumber} of ${pdf.numPages}`)
+    onProgress(Math.round(pageNumber / pdf.numPages * 65), 'pgExtracted', { p: pageNumber, n: pdf.numPages })
   }
-  if (!text.replace(/\[PAGE \d+\]/g, '').trim()) throw new Error('No readable text was found in this document.')
-  onProgress(72, 'Sending OCR evidence to Groq for factual structuring')
+  if (!text.replace(/\[PAGE \d+\]/g, '').trim()) throw new L10nError('errNoTextPdf')
+  onProgress(72, 'structuringPdf')
   const response = await fetch('/api/structure-ddr', { method: 'POST', headers: { 'content-type': 'application/json' }, body: JSON.stringify({ text, words, name: file.name }) })
   const payload = await response.json()
-  if (!response.ok) throw new Error(payload.error || 'Document analysis failed.')
-  onProgress(95, `Indexed ${payload.report.sections?.length || 0} sections from ${pdf.numPages} pages`)
+  if (!response.ok) {
+    if (typeof payload.error === 'string' && payload.error.startsWith('__L10N__')) throw new L10nError(payload.error.slice(8) as StrKey)
+    if (payload.error) throw new Error(payload.error)
+    throw new L10nError('errStruct')
+  }
+  onProgress(95, 'indexedMsg', { sections: payload.report.sections?.length || 0, pages: pdf.numPages })
   return { analysis: payload as Analysis, pages: pdf.numPages }
   } finally { await loadingTask.destroy() }
 }
 
-async function analyseDocument(file: File, onProgress: (progress: number, message: string) => void) {
-  if (/\.tiff?$/i.test(file.name)) throw new Error('Convert TIFF files to PDF or PNG before uploading.')
+async function analyseDocument(file: File, onProgress: (progress: number, key: StrKey, vars?: Record<string, string | number>) => void) {
+  if (/\.tiff?$/i.test(file.name)) throw new L10nError('errTiff')
   if (isImageFile(file)) return analyseImage(file, onProgress)
-  if (!/\.pdf$/i.test(file.name) && file.type !== 'application/pdf') throw new Error('Select a PDF, PNG, JPEG, WebP or BMP file.')
+  if (!/\.pdf$/i.test(file.name) && file.type !== 'application/pdf') throw new L10nError('errType')
   return analysePdf(file, onProgress)
 }
 
@@ -397,6 +413,8 @@ function circlePolygon(center: [number, number], radiusKm: number, points = 64):
 }
 
 function FieldMap({ report, fullscreen, onToggleFullscreen }: { report: Report; fullscreen?: boolean; onToggleFullscreen?: () => void }) {
+  const { t } = useLang()
+  const tRef = useRef(t); tRef.current = t
   const containerRef = useRef<HTMLDivElement>(null)
   const mapRef = useRef<MapLibreMap | null>(null)
   const [radiusKm, setRadiusKm] = useState(25)
@@ -444,7 +462,7 @@ function FieldMap({ report, fullscreen, onToggleFullscreen }: { report: Report; 
     const feats: FeatureCollection<Point> = {
       type: 'FeatureCollection',
       features: [
-        { type: 'Feature', properties: { id: report.well_name || 'Active well', state: 'active', depth: report.current_md }, geometry: { type: 'Point', coordinates: center } },
+        { type: 'Feature', properties: { id: report.well_name || t('activeWellDef'), state: 'active', depth: report.current_md }, geometry: { type: 'Point', coordinates: center } },
         ...filteredOffsets.map((well) => ({
           type: 'Feature' as const,
           properties: { id: well.id, state: 'offset', depth: well.depth, distKm: (well as unknown as { _computedKm: number })._computedKm },
@@ -476,8 +494,9 @@ function FieldMap({ report, fullscreen, onToggleFullscreen }: { report: Report; 
         map.addLayer({ id: 'well-labels', type: 'symbol', source: 'document-wells', layout: { 'text-field': ['get', 'id'], 'text-offset': [0, 1.5], 'text-size': 11 }, paint: { 'text-color': '#315653', 'text-halo-color': '#fff', 'text-halo-width': 1.3 } })
         map.on('click', 'well-points', (event) => {
           const feature = event.features?.[0]; if (!feature) return;
-          const dist = feature.properties?.distKm != null ? `${Number(feature.properties.distKm).toFixed(1)} km` : ''
-          new Popup({ closeButton: false, offset: 14 }).setLngLat((feature.geometry as Point).coordinates as [number, number]).setHTML(`<strong>${feature.properties?.id}</strong><br>${feature.properties?.depth ? `${Number(feature.properties.depth).toLocaleString()} m` : 'Depth not found'}${dist ? ` · ${dist}` : ''}`).addTo(map)
+          const tt = tRef.current
+          const dist = feature.properties?.distKm != null ? `${Number(feature.properties.distKm).toFixed(1)}${tt('unitKm')}` : ''
+          new Popup({ closeButton: false, offset: 14 }).setLngLat((feature.geometry as Point).coordinates as [number, number]).setHTML(`<strong>${feature.properties?.id}</strong><br>${feature.properties?.depth ? `${Number(feature.properties.depth).toLocaleString()}${tt('unitM')}` : tt('depthNotFound')}${dist ? ` · ${dist}` : ''}`).addTo(map)
         })
       }
       map.jumpTo({ center, zoom: 10 })
@@ -512,23 +531,24 @@ function FieldMap({ report, fullscreen, onToggleFullscreen }: { report: Report; 
     if (circleSrc) try { circleSrc.setData(radiusFeature as unknown as never) } catch { /* */ }
   }, [wellFeatures, radiusFeature, center])
 
-  if (!hasCoords || !center) return <div className="map-missing"><MapPinned size={26} /><b>No document coordinates found</b><span>The map will populate only when latitude and longitude are present in the uploaded document.</span></div>
+  if (!hasCoords || !center) return <div className="map-missing"><MapPinned size={26} /><b>{t('noCoords')}</b><span>{t('mapPopulate')}</span></div>
   const isFiltered = filteredOffsets.length !== validOffsets.length
   return <div className={`real-map-wrap ${fullscreen ? 'fullscreen' : ''}`}>
     <div ref={containerRef} className="real-map" style={{ width: '100%', height: '100%' }} />
-    <div className="map-overlay-title">DOCUMENT LOCATIONS <span>• {1 + filteredOffsets.length} / {1 + validOffsets.length} WELLS</span></div>
+    <div className="map-overlay-title">{t('docLocations')} <span>• {1 + filteredOffsets.length} / {1 + validOffsets.length} {t('wellsWord')}</span></div>
     <div className="map-control-strip">
-      <div className="strip-well"><b>{report.well_name || 'Well name not found'}</b><small>{report.latitude!.toFixed(4)}, {report.longitude!.toFixed(4)}{validOffsets.length === 0 ? ' · no offset wells in document' : ''}</small></div>
+      <div className="strip-well"><b>{report.well_name || t('wellNameNA')}</b><small>{report.latitude!.toFixed(4)}, {report.longitude!.toFixed(4)}{validOffsets.length === 0 ? t('noOffset') : ''}</small></div>
       <div className="strip-controls">
-        <label className="strip-group"><span>RADIUS</span><input type="range" min={5} max={50} step={5} value={radiusKm} onChange={(e) => setRadiusKm(Number(e.target.value))} /><strong>{radiusKm} km</strong></label>
-        <label className="strip-group"><span>FORMATION</span><select value={formationFilter} onChange={(e) => setFormationFilter(e.target.value)}><option value="all">All</option>{formationOptions.map(n => <option key={n} value={n}>{n}</option>)}</select></label>
-        {isFiltered && <button className="strip-reset" onClick={() => { setRadiusKm(25); setFormationFilter('all') }}>Reset</button>}
-        {onToggleFullscreen && <button className="strip-icon-btn" aria-label="Toggle fullscreen" onClick={onToggleFullscreen}>{fullscreen ? <X size={14} /> : <Maximize2 size={14} />}</button>}
+        <label className="strip-group"><span>{t('radius')}</span><input type="range" min={5} max={50} step={5} value={radiusKm} onChange={(e) => setRadiusKm(Number(e.target.value))} /><strong>{radiusKm}{t('unitKm')}</strong></label>
+        <label className="strip-group"><span>{t('formationLbl')}</span><select value={formationFilter} onChange={(e) => setFormationFilter(e.target.value)}><option value="all">{t('fAll')}</option>{formationOptions.map(n => <option key={n} value={n}>{n}</option>)}</select></label>
+        {isFiltered && <button className="strip-reset" onClick={() => { setRadiusKm(25); setFormationFilter('all') }}>{t('resetBtn')}</button>}
+        {onToggleFullscreen && <button className="strip-icon-btn" aria-label={t('toggleFs')} onClick={onToggleFullscreen}>{fullscreen ? <X size={14} /> : <Maximize2 size={14} />}</button>}
       </div>
     </div></div>
 }
 
 function PdfViewer({ document }: { document: IndexedDocument }) {
+  const { t } = useLang()
   const canvasRef = useRef<HTMLCanvasElement>(null); const [page, setPage] = useState(1)
   const isImage = /\.(png|jpe?g|webp|tiff|bmp)$/i.test(document.name)
   useEffect(() => {
@@ -536,40 +556,44 @@ function PdfViewer({ document }: { document: IndexedDocument }) {
     let cancelled = false; (async () => { const pdf = await getDocument({ url: document.url }).promise; const current = await pdf.getPage(page); const viewport = current.getViewport({ scale: 1.5 }); const canvas = canvasRef.current; if (!canvas || cancelled) return; const context = canvas.getContext('2d'); if (!context) return; canvas.width = viewport.width; canvas.height = viewport.height; await current.render({ canvas, canvasContext: context, viewport }).promise })().catch(() => undefined); return () => { cancelled = true }
   }, [document.url, page, isImage])
   const segments = document.segments.filter((segment) => segment.page === page)
-  if (isImage) return <div className="pdf-canvas-shell"><div className="pdf-page-controls"><span>PAGE 1 OF 1 · IMAGE DOCUMENT</span></div><div className="pdf-page" style={{ display: 'grid', placeItems: 'center', overflow: 'auto' }}><img src={document.url} alt={document.name} style={{ maxWidth: '100%', maxHeight: '100%', objectFit: 'contain' }} />{segments.map((segment, index) => <div key={`${segment.label}-${index}`} className={`seg-box ${segment.tone} visible`} style={{ left: `${segment.x}%`, top: `${segment.y}%`, width: `${segment.w}%`, height: `${segment.h}%` }}><span>{segment.label}</span></div>)}</div></div>
-  return <div className="pdf-canvas-shell"><div className="pdf-page-controls"><button disabled={page === 1} onClick={() => setPage((current) => current - 1)}>← Previous</button><span>PAGE {page} OF {document.pages}</span><button disabled={page === document.pages} onClick={() => setPage((current) => current + 1)}>Next →</button></div><div className="pdf-page"><canvas ref={canvasRef} />{segments.map((segment, index) => <div key={`${segment.label}-${index}`} className={`seg-box ${segment.tone} visible`} style={{ left: `${segment.x}%`, top: `${segment.y}%`, width: `${segment.w}%`, height: `${segment.h}%` }}><span>{segment.label}</span></div>)}</div></div>
+  if (isImage) return <div className="pdf-canvas-shell"><div className="pdf-page-controls"><span>{t('pageImage')}</span></div><div className="pdf-page" style={{ display: 'grid', placeItems: 'center', overflow: 'auto' }}><img src={document.url} alt={document.name} style={{ maxWidth: '100%', maxHeight: '100%', objectFit: 'contain' }} />{segments.map((segment, index) => <div key={`${segment.label}-${index}`} className={`seg-box ${segment.tone} visible`} style={{ left: `${segment.x}%`, top: `${segment.y}%`, width: `${segment.w}%`, height: `${segment.h}%` }}><span>{segment.label}</span></div>)}</div></div>
+  return <div className="pdf-canvas-shell"><div className="pdf-page-controls"><button disabled={page === 1} onClick={() => setPage((current) => current - 1)}>{t('prev')}</button><span>{t('pageOf', { p: page, n: document.pages })}</span><button disabled={page === document.pages} onClick={() => setPage((current) => current + 1)}>{t('next')}</button></div><div className="pdf-page"><canvas ref={canvasRef} />{segments.map((segment, index) => <div key={`${segment.label}-${index}`} className={`seg-box ${segment.tone} visible`} style={{ left: `${segment.x}%`, top: `${segment.y}%`, width: `${segment.w}%`, height: `${segment.h}%` }}><span>{segment.label}</span></div>)}</div></div>
 }
 
 function PanelHeader({ icon, title, meta }: { icon: ReactNode; title: string; meta?: string }) { return <div className="panel-header"><span className="panel-title"><i>{icon}</i>{title}</span>{meta && <span className="panel-meta">{meta}</span>}</div> }
-function EmptyWorkspace({ view }: { view: View }) { const copy = view === 'documents' ? 'Upload a DDR, WCR, scan, or mud log to start OCR and factual extraction.' : view === 'embeddings' ? 'Upload and index documents before exploring their text-vector relationships.' : view === 'prediction' ? 'Upload an indexed report before asking evidence-grounded questions.' : 'Upload a drilling document to populate the map, well data, events, risks, and correlations.'; return <section className="empty-workspace"><FileScan size={30} /><h2>No operational data loaded</h2><p>{copy}</p><span>Use <b>Ingest document</b> in the sidebar to begin.</span></section> }
+function EmptyWorkspace({ view }: { view: View }) { const { t } = useLang(); const copy = view === 'documents' ? t('emptyDocs') : view === 'embeddings' ? t('emptyEmbed') : view === 'prediction' ? t('emptyPredict') : t('emptyCommand'); return <section className="empty-workspace"><FileScan size={30} /><h2>{t('noData')}</h2><p>{copy}</p><span>{t('emptyCta1')} <b>{t('ingestDoc')}</b> {t('emptyCta2')}</span></section> }
 
-function DocumentPanel({ document, processing, progress, status }: { document: IndexedDocument; processing: boolean; progress: number; status: string }) { return <><PanelHeader icon={<FileScan size={16} />} title="DOCUMENT INTELLIGENCE" meta={processing ? `${progress}%` : 'INDEXED'} /><div className="document-stage"><div className="paper"><PdfViewer document={document} /></div></div><div className="document-footer"><span><i className="live-dot" /> {status}</span><span>{document.segments.length ? `${document.segments.length} REGIONS · ` : 'TEXT OCR · '}{document.pages} PAGES</span></div></> }
+function DocumentPanel({ document, processing, progress, status }: { document: IndexedDocument; processing: boolean; progress: number; status: string }) { const { t } = useLang(); return <><PanelHeader icon={<FileScan size={16} />} title={t('docIntel')} meta={processing ? `${progress}%` : t('indexed')} /><div className="document-stage"><div className="paper"><PdfViewer document={document} /></div></div><div className="document-footer"><span><i className="live-dot" /> {status}</span><span>{document.segments.length ? t('regions', { count: document.segments.length }) : t('textOcr')}{t('pages', { count: document.pages })}</span></div></> }
 
 function DepthPanel({ report, onOpenDive }: { report: Report; onOpenDive?: () => void }) {
+  const { t } = useLang()
+  const nf = t('notFound'); const um = t('unitM')
   const formations = report.formations?.length ? report.formations : report.formation ? [{ name: report.formation, top_md: null, bottom_md: null }] : []
   return <>
-    <PanelHeader icon={<Activity size={16} />} title="ACTIVE WELL" meta={report.well_name || 'NAME NOT FOUND'} />
-    <div className="active-depth"><span>MEASURED DEPTH</span><strong>{value(report.current_md, ' m')}</strong><b>{report.formation || 'FORMATION NOT FOUND'}</b></div>
-    <div className="extracted-metrics"><span><small>TVD</small><b>{value(report.current_tvd, ' m')}</b></span><span><small>PROGRESS</small><b>{value(report.progress, ' m')}</b></span><span><small>AVG ROP</small><b>{value(report.avg_rop, ' m/h')}</b></span><span><small>MUD WEIGHT</small><b>{value(report.mud_weight)}</b></span></div>
-    <div className="formation-list">{formations.length ? formations.map((formation, index) => <div key={`${formation.name}-${index}`}><strong>{formation.name}</strong><span>{formation.top_md === null && formation.bottom_md === null ? 'Depth interval not stated' : `${value(formation.top_md, ' m')} – ${value(formation.bottom_md, ' m')}`}</span></div>) : <p>No formation intervals found in the document.</p>}</div>
-    {onOpenDive && <button className="coral-action" onClick={onOpenDive} style={{ margin: '0 14px 14px' }}><Waves size={14} /> OPEN WELL DIVE</button>}
+    <PanelHeader icon={<Activity size={16} />} title={t('activeWell')} meta={report.well_name || t('nameNotFound')} />
+    <div className="active-depth"><span>{t('measuredDepth')}</span><strong>{value(report.current_md, um, nf)}</strong><b>{report.formation || t('formationNotFound')}</b></div>
+    <div className="extracted-metrics"><span><small>{t('tvd')}</small><b>{value(report.current_tvd, um, nf)}</b></span><span><small>{t('progressLbl')}</small><b>{value(report.progress, um, nf)}</b></span><span><small>{t('avgRop')}</small><b>{value(report.avg_rop, t('unitRop'), nf)}</b></span><span><small>{t('mudWeight')}</small><b>{value(report.mud_weight, '', nf)}</b></span></div>
+    <div className="formation-list">{formations.length ? formations.map((formation, index) => <div key={`${formation.name}-${index}`}><strong>{formation.name}</strong><span>{formation.top_md === null && formation.bottom_md === null ? t('depthIntervalNA') : `${value(formation.top_md, um, nf)} – ${value(formation.bottom_md, um, nf)}`}</span></div>) : <p>{t('noFormations')}</p>}</div>
+    {onOpenDive && <button className="coral-action" onClick={onOpenDive} style={{ margin: '0 14px 14px' }}><Waves size={14} /> {t('openDive')}</button>}
   </>
 }
 
 function StreamPanel({ document, status }: { document: IndexedDocument; status: string }) {
+  const { t } = useLang()
+  const um = t('unitM')
   const isOrangeSection = (label: string) => {
     const l = label.toLowerCase()
     return l.includes('operation') || l.includes('event') || l.includes('fluid') || l.includes('decision') || l.includes('casing') || l.includes('cement') || l.includes('risk')
   }
   const sectionItems = document.report.sections.map((section) => ({
     title: section.label,
-    detail: section.summary || (section.evidence ? section.evidence.slice(0, 110) : 'Section indexed'),
+    detail: section.summary || (section.evidence ? section.evidence.slice(0, 110) : t('sectionIndexed')),
     icon: <Database size={15} />,
     tone: isOrangeSection(section.label) ? 'amber' : 'cyan',
   }))
   const eventItems = document.report.events.map((event) => ({
     title: event.type,
-    detail: `${event.time ? event.time + ' · ' : ''}${event.depth === null ? 'Depth not stated' : `${event.depth.toLocaleString()} m`} · ${event.evidence} ${event.severity ? `· ${event.severity}` : ''}`,
+    detail: `${event.time ? event.time + ' · ' : ''}${event.depth === null ? t('depthNA') : `${event.depth.toLocaleString()}${um}`} · ${event.evidence} ${event.severity ? `· ${event.severity}` : ''}`,
     icon: <AlertTriangle size={15} />,
     tone: 'amber',
   }))
@@ -580,27 +604,30 @@ function StreamPanel({ document, status }: { document: IndexedDocument; status: 
     tone: 'amber',
   }))
   const offsetItems = document.report.offset_wells.slice(0, 3).map((well) => ({
-    title: `Offset ${well.id}`,
-    detail: `${well.distance_km !== null ? `${well.distance_km} km` : 'Distance not stated'} · ${well.relationship || 'Nearby well context'}`,
+    title: t('offsetW', { id: well.id }),
+    detail: `${well.distance_km !== null ? `${well.distance_km}${t('unitKm')}` : t('distNA')} · ${well.relationship || t('nearbyCtx')}`,
     icon: <MapPinned size={15} />,
     tone: 'cyan',
   }))
   const items = [
-    { title: 'PDF + OCR extraction', detail: status, icon: <FileText size={15} />, tone: 'cyan' },
+    { title: t('pdfOcr'), detail: status, icon: <FileText size={15} />, tone: 'cyan' },
     ...sectionItems,
     ...eventItems,
     ...riskItems,
     ...offsetItems,
   ]
-  return <><PanelHeader icon={<Zap size={16} />} title="LIVE PARSING STREAM" meta={`${items.length} ITEMS · DOCUMENT PIPELINE`} /><div className="stream-list" style={{ maxHeight: 420, overflowY: 'auto' }}>{items.map((item, index) => <div className="stream-item" key={`${item.title}-${index}`}><time>NOW</time><span className={`stream-icon ${item.tone}`}>{item.icon}</span><div><strong>{item.title}</strong><span>{item.detail}</span></div><ArrowUpRight size={13} /></div>)}</div></>
+  return <><PanelHeader icon={<Zap size={16} />} title={t('liveStream')} meta={t('itemsPipe', { count: items.length })} /><div className="stream-list" style={{ maxHeight: 420, overflowY: 'auto' }}>{items.map((item, index) => <div className="stream-item" key={`${item.title}-${index}`}><time>{t('now')}</time><span className={`stream-icon ${item.tone}`}>{item.icon}</span><div><strong>{item.title}</strong><span>{item.detail}</span></div><ArrowUpRight size={13} /></div>)}</div></>
 }
 
 function RiskRow({ risks, events, openPrediction }: { risks: Risk[]; events: Event[]; openPrediction: () => void }) {
+  const { t } = useLang()
+  const um = t('unitM')
+  const trendLbl = (trend: Risk['trend']) => trend === 'rising' ? t('trendRising') : trend === 'falling' ? t('trendFalling') : trend === 'steady' ? t('trendSteady') : t('notStated')
   const shown = risks.slice(0, 4)
-  return <section className="risk-row dynamic-risk-row"><div className="risk-label"><AlertTriangle size={22} /><div><small>DOCUMENT EVIDENCE</small><strong>RISK WATCH</strong></div><span className="risk-count">{risks.length ? `${risks.length} TRACKED` : 'NO DATA'}</span></div><div className="risk-cards">{shown.length ? shown.map((risk) => {
+  return <section className="risk-row dynamic-risk-row"><div className="risk-label"><AlertTriangle size={22} /><div><small>{t('docEvidence')}</small><strong>{t('riskWatch')}</strong></div><span className="risk-count">{risks.length ? t('tracked', { count: risks.length }) : t('noDataLbl')}</span></div><div className="risk-cards">{shown.length ? shown.map((risk) => {
     const tone = risk.trend === 'rising' ? 'critical' : risk.trend === 'falling' ? 'calm' : 'warning'
-    return <button className={`risk-card ${tone}`} key={risk.label} title={risk.evidence}><span className="risk-top"><small>{risk.label}</small><i className={`risk-dot ${risk.trend || ''}`} /></span><strong>{risk.probability === null ? '—' : <>{risk.probability}<em>%</em></>}</strong><span className={`risk-pill ${risk.trend || 'none'}`}>{risk.trend || 'NOT STATED'}</span></button>
-  }) : <div className="no-risk-data">No risk probabilities were stated or extracted.</div>}</div><div className="alerts-card"><span className="alert-count">EVENTS ({events.length})</span><div className="alerts-list">{events.length ? events.slice(0, 2).map((event, index) => <span className="alert-row" key={`${event.type}-${index}`}><b>{event.time || '—'}</b> · {event.type}{event.depth === null ? '' : ` @ ${event.depth.toLocaleString()} m`}</span>) : <span className="alerts-empty">No events extracted</span>}</div><button onClick={openPrediction}>ASK ABOUT EVENTS <ArrowUpRight size={13} /></button></div></section>
+    return <button className={`risk-card ${tone}`} key={risk.label} title={risk.evidence}><span className="risk-top"><small>{risk.label}</small><i className={`risk-dot ${risk.trend || ''}`} /></span><strong>{risk.probability === null ? '—' : <>{risk.probability}<em>%</em></>}</strong><span className={`risk-pill ${risk.trend || 'none'}`}>{trendLbl(risk.trend)}</span></button>
+  }) : <div className="no-risk-data">{t('noRiskData')}</div>}</div><div className="alerts-card"><span className="alert-count">{t('eventsLbl', { count: events.length })}</span><div className="alerts-list">{events.length ? events.slice(0, 2).map((event, index) => <span className="alert-row" key={`${event.type}-${index}`}><b>{event.time || '—'}</b> · {event.type}{event.depth === null ? '' : ` @ ${event.depth.toLocaleString()}${um}`}</span>) : <span className="alerts-empty">{t('noEvents')}</span>}</div><button onClick={openPrediction}>{t('askAboutEvents')} <ArrowUpRight size={13} /></button></div></section>
 }
 
 function Sparkline({ values, color = '#e86b4d' }: { values: (number | null)[]; color?: string }) {
@@ -617,11 +644,18 @@ function Sparkline({ values, color = '#e86b4d' }: { values: (number | null)[]; c
 }
 
 function TelemetryPanel({ report }: { report: Report }) {
+  const { t } = useLang()
+  const um = t('unitM')
+  const kindLbl = (k: TelemetryAlert['kind']) => k === 'Mud Loss' ? t('kMudLoss') : k === 'Kick' ? t('kKick') : k === 'Stuck Pipe' ? t('kStuck') : k === 'Overpressure' ? t('kOver') : t('kSpike')
+  const sevLbl = (s: TelemetryAlert['severity']) => s === 'high' ? t('sevHigh') : s === 'medium' ? t('sevMedium') : t('sevLow')
+  const evText = (e: string) => e === '__NONE__' ? t('noOffsetEv') : e.startsWith('__SIM__') ? t('simHazard', { f: e.slice(7) }) : e
   const [samples, setSamples] = useState<TelemetrySample[]>(() => generateSyntheticTelemetry(report))
   const [idx, setIdx] = useState(0)
   const [playing, setPlaying] = useState(false)
   const [speed, setSpeed] = useState(1)
   const [alerts, setAlerts] = useState<TelemetryAlert[]>([])
+  const [csvError, setCsvError] = useState('')
+  const setErrorMsg = setCsvError
   const fileRef = useRef<HTMLInputElement>(null)
 
   useEffect(() => {
@@ -653,7 +687,7 @@ function TelemetryPanel({ report }: { report: Report }) {
       })
       if (isSupabaseConfigured) {
         for (const fa of fresh) {
-          saveAlertToSupabase(report.well_name, { time: fa.time, depth: fa.depth, kind: fa.kind, severity: fa.severity, message: fa.message, evidence: fa.evidence }).catch(() => {})
+          saveAlertToSupabase(report.well_name, { time: fa.time, depth: fa.depth, kind: fa.kind, severity: fa.severity, message: enText(fa.messageKey, fa.messageVars), evidence: fa.evidence === '__NONE__' ? enText('noOffsetEv') : fa.evidence.startsWith('__SIM__') ? enText('simHazard', { f: fa.evidence.slice(7) }) : fa.evidence }).catch(() => {})
         }
       }
     }
@@ -679,8 +713,8 @@ function TelemetryPanel({ report }: { report: Report }) {
     try {
       const text = await f.text()
       const parsed = parseTelemetryCsv(text)
-      setSamples(parsed); setIdx(0); setAlerts([]); setPlaying(false)
-    } catch (err) { alert(err instanceof Error ? err.message : String(err)) }
+      setSamples(parsed); setIdx(0); setAlerts([]); setPlaying(false); setCsvError('')
+    } catch (err) { setErrorMsg(err instanceof L10nError ? t(err.key, err.vars) : err instanceof Error ? err.message : t('errCsv')) }
     if (fileRef.current) fileRef.current.value = ''
   }
 
@@ -688,16 +722,17 @@ function TelemetryPanel({ report }: { report: Report }) {
   const unacked = activeAlerts.filter(a => !a.acknowledged).length
 
   return <section className="panel telemetry-panel">
-    <PanelHeader icon={<Gauge size={16} />} title="eRTMAC TELEMETRY REPLAY" meta={`${samples.length} SAMPLES · ${current ? `${current.depth} m` : ''} · ${playing ? 'LIVE' : 'PAUSED'}`} />
+    <PanelHeader icon={<Gauge size={16} />} title={t('teleReplay')} meta={t('samplesMeta', { count: samples.length, depth: current ? `${current.depth}${um}` : '', state: playing ? t('teleLive') : t('telePaused') })} />
     <div className="telemetry-controls">
-      <button className="tele-btn primary" onClick={() => setPlaying(v => !v)}>{playing ? <Pause size={13} /> : <Play size={13} />} {playing ? 'PAUSE' : 'PLAY'}</button>
-      <button className="tele-btn" onClick={() => setIdx(i => Math.max(0, i - 1))}>‹ STEP</button>
-      <button className="tele-btn" onClick={() => setIdx(i => Math.min(samples.length - 1, i + 1))}>STEP ›</button>
-      <button className="tele-btn" onClick={() => { setIdx(0); setPlaying(false); setAlerts([]) }}><RotateCcw size={12} /> RESET</button>
-      <label className="tele-speed"><span>SPEED</span><select value={speed} onChange={e => setSpeed(parseInt(e.target.value))}><option value={1}>1×</option><option value={2}>2×</option><option value={3}>4×</option></select></label>
+      <button className="tele-btn primary" onClick={() => setPlaying(v => !v)}>{playing ? <Pause size={13} /> : <Play size={13} />} {playing ? t('pause') : t('play')}</button>
+      <button className="tele-btn" onClick={() => setIdx(i => Math.max(0, i - 1))}>{t('stepBack')}</button>
+      <button className="tele-btn" onClick={() => setIdx(i => Math.min(samples.length - 1, i + 1))}>{t('stepFwd')}</button>
+      <button className="tele-btn" onClick={() => { setIdx(0); setPlaying(false); setAlerts([]) }}><RotateCcw size={12} /> {t('reset')}</button>
+      <label className="tele-speed"><span>{t('speed')}</span><select value={speed} onChange={e => setSpeed(parseInt(e.target.value))}><option value={1}>1×</option><option value={2}>2×</option><option value={3}>4×</option></select></label>
       <div className="tele-scrub"><input type="range" min={0} max={Math.max(0, samples.length - 1)} value={idx} onChange={e => setIdx(parseInt(e.target.value))} /><span>{idx + 1} / {samples.length}</span></div>
-      <label className="tele-upload"><Upload size={12} /> CSV<input ref={fileRef} type="file" accept=".csv,.json" onChange={handleCsv} /></label>
+      <label className="tele-upload"><Upload size={12} /> {t('csv')}<input ref={fileRef} type="file" accept=".csv,.json" onChange={handleCsv} /></label>
     </div>
+    {csvError && <div className="tele-empty" role="alert">{csvError}</div>}
     <div className="telemetry-metrics">
       {([
         ['WOB', current?.wob, 'klb', '#e86b4d'],
@@ -709,7 +744,7 @@ function TelemetryPanel({ report }: { report: Report }) {
         ['GAS', current?.gas, 'u', (current?.gas ?? 0) > 2.5 ? '#e86b4d' : '#55c9c5'],
         ['MW', current?.mudWeight, 'ppg', '#6e8d8a'],
       ] as const).map(([label, val, unit, col]) => (
-        <span key={label} className="tele-metric" style={{ borderLeftColor: String(col) }}><small>{label}</small><b style={{ color: label === 'FLOW OUT' && String(col) === '#e86b4d' ? '#e86b4d' : undefined }}>{val === null || val === undefined ? '—' : `${val}`}<em> {unit}</em></b><i className={`qdot ${current?.quality}`} title={current?.quality} /></span>
+        <span key={label} className="tele-metric" style={{ borderLeftColor: String(col) }}><small>{label}</small><b style={{ color: label === 'FLOW OUT' && String(col) === '#e86b4d' ? '#e86b4d' : undefined }}>{val === null || val === undefined ? '—' : `${val}`}<em> {unit}</em></b><i className={`qdot ${current?.quality}`} title={current?.quality === 'good' ? t('qGood') : current?.quality === 'degraded' ? t('qDegraded') : current?.quality === 'missing' ? t('qMissing') : current?.quality} /></span>
       ))}
     </div>
     <div className="telemetry-charts">
@@ -717,20 +752,20 @@ function TelemetryPanel({ report }: { report: Report }) {
       <div><small>TORQUE</small><Sparkline values={windowSamples.map(s => s.torque)} color="#e9b65b" /></div>
       <div><small>SPP</small><Sparkline values={windowSamples.map(s => s.spp)} color="#8d7bb6" /></div>
       <div><small>GAS</small><Sparkline values={windowSamples.map(s => s.gas)} color={activeAlerts.some(a => a.kind === 'Kick') ? '#e86b4d' : '#55c9c5'} /></div>
-      <div className="tele-depth-sweep"><small>DEPTH</small><strong>{current?.depth ?? '—'} m</strong><span>formation {report.formation || '—'}</span></div>
+      <div className="tele-depth-sweep"><small>{t('teleDepth')}</small><strong>{current?.depth ?? '—'}{um}</strong><span>{t('formationWord')} {report.formation || '—'}</span></div>
     </div>
     <div className="telemetry-alerts">
-      <div className="tele-alert-head"><span><AlertTriangle size={13} /> ALERTS {unacked > 0 && <em>{unacked} NEW</em>}</span><small>persistence {3} · cooldown {6} · hysteresis 2 normal to clear</small><button onClick={clearSuppressed}>Clear suppressed</button></div>
-      {activeAlerts.length === 0 ? <div className="tele-empty">No alerts — replay to see persistence-gated Mud Loss / Kick / Stuck Pipe / Overpressure / Torque Spike (evidence from indexed DDR)</div> : (
+      <div className="tele-alert-head"><span><AlertTriangle size={13} /> {t('alerts')} {unacked > 0 && <em>{t('newBadge', { count: unacked })}</em>}</span><small>{t('persistNote', { p: 3, c: 6 })}</small><button onClick={clearSuppressed}>{t('clearSupp')}</button></div>
+      {activeAlerts.length === 0 ? <div className="tele-empty">{t('noAlerts')}</div> : (
         <div className="tele-alert-list">
           {activeAlerts.slice(0, 8).map(a => (
             <div key={a.id} className={`tele-alert ${a.severity} ${a.acknowledged ? 'acked' : ''}`}>
-              <span className="tele-alert-kind">{a.kind === 'Mud Loss' ? <Waves size={12} /> : a.kind === 'Kick' ? <Flame size={12} /> : a.kind === 'Stuck Pipe' ? <Anchor size={12} /> : <Zap size={12} />}{a.kind}</span>
-              <div className="tele-alert-body"><strong>{a.time} · {a.depth} m · {a.severity}</strong><span>{a.message}</span><small>{a.evidence}</small></div>
+              <span className="tele-alert-kind">{a.kind === 'Mud Loss' ? <Waves size={12} /> : a.kind === 'Kick' ? <Flame size={12} /> : a.kind === 'Stuck Pipe' ? <Anchor size={12} /> : <Zap size={12} />}{kindLbl(a.kind)}</span>
+              <div className="tele-alert-body"><strong>{a.time} · {a.depth}{um} · {sevLbl(a.severity)}</strong><span>{t(a.messageKey, a.messageVars)}</span><small>{evText(a.evidence)}</small></div>
               <div className="tele-alert-actions">
-                {!a.acknowledged && <button onClick={() => ack(a.id)}>Ack</button>}
-                <button onClick={() => suppress(a.id)}>Suppress</button>
-                {a.severity !== 'high' && <button onClick={() => escalate(a.id)}>Escalate</button>}
+                {!a.acknowledged && <button onClick={() => ack(a.id)}>{t('ack')}</button>}
+                <button onClick={() => suppress(a.id)}>{t('suppress')}</button>
+                {a.severity !== 'high' && <button onClick={() => escalate(a.id)}>{t('escalate')}</button>}
               </div>
             </div>
           ))}
@@ -741,6 +776,8 @@ function TelemetryPanel({ report }: { report: Report }) {
 }
 
 function EmbeddingPanel({ documents }: { documents: IndexedDocument[] }) {
+  const { t } = useLang()
+  const um = t('unitM')
   const [selectedName, setSelectedName] = useState<string | null>(documents[0]?.name ?? null)
   const vectors = useMemo(() => documents.map((d) => d.documentVector).filter((v): v is number[] => Array.isArray(v) && v.length > 0), [documents])
   const positions = useMemo(() => {
@@ -756,12 +793,12 @@ function EmbeddingPanel({ documents }: { documents: IndexedDocument[] }) {
   const selected = useMemo(() => documents.find((d) => d.name === selectedName) ?? documents[0] ?? null, [documents, selectedName])
   const model = documents[0]?.embeddingModel ?? '—'
   if (documents.length === 0) {
-    return <><PanelHeader icon={<Network size={16} />} title="DOCUMENT TEXT VECTOR SPACE" meta="NO SITES INDEXED" /><div className="empty-workspace" style={{ minHeight: 320, border: 'none', background: '#fafaf8' }}><Network size={28} /><h2>No drilling sites indexed</h2><p>Ingest 2+ DDRs/WCRs to see document similarity. Similar sites cluster closer.</p></div></>
+    return <><PanelHeader icon={<Network size={16} />} title={t('vecSpace')} meta={t('noSites')} /><div className="empty-workspace" style={{ minHeight: 320, border: 'none', background: '#fafaf8' }}><Network size={28} /><h2>{t('noSitesTitle')}</h2><p>{t('noSitesBody')}</p></div></>
   }
   if (documents.length === 1) {
-    return <><PanelHeader icon={<Network size={16} />} title="DOCUMENT TEXT VECTOR SPACE" meta={`${model} · 1 SITE`} /><div className="embedding-canvas large-canvas"><div className="embedding-axis horizontal" /><div className="embedding-axis vertical" /><button className="embedding-point coral selected" style={{ left: '50%', top: '50%' }} aria-label={documents[0].report.well_name ?? documents[0].name} onClick={() => setSelectedName(documents[0].name)} /><div className="embedding-tooltip" style={{ left: '58%', top: '57%' }}><strong>{documents[0].report.well_name ?? documents[0].name}</strong><span>{documents[0].report.formation ?? 'Formation not stated'} · {value(documents[0].report.current_md, ' m')} · {documents[0].report.sections.length} sections</span><small>Upload another document to see distance.</small></div></div></>
+    return <><PanelHeader icon={<Network size={16} />} title={t('vecSpace')} meta={t('modelSites1', { model })} /><div className="embedding-canvas large-canvas"><div className="embedding-axis horizontal" /><div className="embedding-axis vertical" /><button className="embedding-point coral selected" style={{ left: '50%', top: '50%' }} aria-label={documents[0].report.well_name ?? documents[0].name} onClick={() => setSelectedName(documents[0].name)} /><div className="embedding-tooltip" style={{ left: '58%', top: '57%' }}><strong>{documents[0].report.well_name ?? documents[0].name}</strong><span>{documents[0].report.formation ?? t('formationNA2')} · {value(documents[0].report.current_md, um, t('notFound'))} · {documents[0].report.sections.length} {t('secsWord')}</span><small>{t('uploadAnother')}</small></div></div></>
   }
-  return <><PanelHeader icon={<Network size={16} />} title="DOCUMENT TEXT VECTOR SPACE" meta={`${model} · ${documents.length} SITES`} /><div className="embedding-canvas large-canvas"><div className="embedding-axis horizontal" /><div className="embedding-axis vertical" />{documents.map((doc, idx) => {
+  return <><PanelHeader icon={<Network size={16} />} title={t('vecSpace')} meta={t('modelSitesN', { model, count: documents.length })} /><div className="embedding-canvas large-canvas"><div className="embedding-axis horizontal" /><div className="embedding-axis vertical" />{documents.map((doc, idx) => {
     const pos = positions[idx] ?? { x: 50, y: 50 }
     const isSel = doc.name === selected?.name
     const tone = doc.report.formation?.toLowerCase().includes('barail') ? 'coral' : doc.report.formation?.toLowerCase().includes('tipam') ? 'amber' : 'cyan'
@@ -769,11 +806,12 @@ function EmbeddingPanel({ documents }: { documents: IndexedDocument[] }) {
   })}{selected && (() => {
     const selIdx = documents.findIndex((d) => d.name === selected.name)
     const sims = documents.filter((d) => d.name !== selected.name).map((d) => ({ name: d.report.well_name ?? d.name, score: cosine(selected.documentVector ?? [], d.documentVector ?? []) })).sort((a, b) => b.score - a.score).slice(0, 2)
-    return <div className="embedding-tooltip"><strong>{selected.report.well_name ?? selected.name}</strong><span>{selected.report.formation ?? 'Formation not found'} · {value(selected.report.current_md, ' m')} · {selected.report.events.length} events</span><small style={{ display: 'block', marginTop: 6, color: '#7a8a87' }}>{sims.length ? `Closest: ${sims.map((s) => `${s.name} (${(s.score * 100).toFixed(1)}%)`).join(' · ')}` : 'No comparison'}</small></div>
-  })()}<div style={{ position: 'absolute', left: 10, bottom: 8, fontSize: 7, color: '#a0a6a2', letterSpacing: '.06em', fontWeight: 800 }}>CLOSER = MORE SIMILAR (COSINE)</div></div></>
+    return <div className="embedding-tooltip"><strong>{selected.report.well_name ?? selected.name}</strong><span>{selected.report.formation ?? t('formationNFFull')} · {value(selected.report.current_md, um, t('notFound'))} · {selected.report.events.length} {t('evtsWord')}</span><small style={{ display: 'block', marginTop: 6, color: '#7a8a87' }}>{sims.length ? `${t('closest')}: ${sims.map((s) => `${s.name} (${(s.score * 100).toFixed(1)}%)`).join(' · ')}` : t('noCompare')}</small></div>
+  })()}<div style={{ position: 'absolute', left: 10, bottom: 8, fontSize: 7, color: '#a0a6a2', letterSpacing: '.06em', fontWeight: 800 }}>{t('closerNote')}</div></div></>
 }
 
 function PredictionPanel({ document, question, setQuestion }: { document: IndexedDocument; question: string; setQuestion: (value: string) => void }) {
+  const { t } = useLang()
   const [answer, setAnswer] = useState(''); const [asking, setAsking] = useState(false)
   const [mudDelta, setMudDelta] = useState(0)
   const [flowDelta, setFlowDelta] = useState(0)
@@ -783,9 +821,9 @@ function PredictionPanel({ document, question, setQuestion }: { document: Indexe
   const baseMud = parseMudWeight(document.report.mud_weight)
   const whatIfRisks = useMemo(() => computeWhatIfRisks(document.report.risks || [], mudDelta, flowDelta, wobDelta), [document.report.risks, mudDelta, flowDelta, wobDelta])
   const hasWhatIf = mudDelta !== 0 || flowDelta !== 0 || wobDelta !== 0
-  async function ask(event: FormEvent) { event.preventDefault(); if (!question.trim()) return; setAsking(true); setAnswer(''); try { const response = await fetch('/api/ask', { method: 'POST', headers: { 'content-type': 'application/json' }, body: JSON.stringify({ question, corpus: document.corpus }) }); const payload = await response.json(); if (!response.ok) throw new Error(payload.error); setAnswer(payload.answer) } catch (error) { setAnswer(error instanceof Error ? error.message : 'Ask NWIS failed.') } finally { setAsking(false) } }
+  async function ask(event: FormEvent) { event.preventDefault(); if (!question.trim()) return; setAsking(true); setAnswer(''); try { const response = await fetch('/api/ask', { method: 'POST', headers: { 'content-type': 'application/json' }, body: JSON.stringify({ question, corpus: document.corpus }) }); const payload = await response.json(); if (!response.ok) throw new Error(payload.error); setAnswer(payload.answer) } catch (error) { setAnswer(error instanceof Error && error.message && !error.message.startsWith('__L10N__') ? error.message : t('errAsk')) } finally { setAsking(false) } }
   async function simulate() {
-    if (!document.report.risks.length) { setWhatIfAnswer('No risks were extracted from this document to simulate. Upload a DDR with risk or event evidence.'); return }
+    if (!document.report.risks.length) { setWhatIfAnswer(t('errWhatifNoRisks')); return }
     setSimulating(true); setWhatIfAnswer('')
     const table = whatIfRisks.map(r => `${r.label}: base ${r.base}% → what-if ${r.adjusted}% (Δ${r.delta > 0 ? '+' : ''}${r.delta}%, trend ${r.trend}) — evidence: ${r.evidence.slice(0, 110)}`).join('\n')
     const proposed = `Mud weight Δ ${mudDelta > 0 ? '+' : ''}${mudDelta.toFixed(2)} ppg (base ${baseMud !== null ? baseMud + ' ppg' : document.report.mud_weight || 'not stated'}), Flow Δ ${flowDelta > 0 ? '+' : ''}${flowDelta}% , WOB Δ ${wobDelta > 0 ? '+' : ''}${wobDelta}% at ${value(document.report.current_md, ' m')} in ${document.report.formation || 'formation not stated'}.`
@@ -793,40 +831,42 @@ function PredictionPanel({ document, question, setQuestion }: { document: Indexe
     try {
       const response = await fetch('/api/ask', { method: 'POST', headers: { 'content-type': 'application/json' }, body: JSON.stringify({ question: whatIfQuestion, corpus: document.corpus }) })
       const payload = await response.json(); if (!response.ok) throw new Error(payload.error); setWhatIfAnswer(payload.answer)
-    } catch (error) { setWhatIfAnswer(error instanceof Error ? error.message : 'What-if simulation failed.') } finally { setSimulating(false) }
+    } catch (error) { setWhatIfAnswer(error instanceof Error && error.message ? error.message : t('errWhatif')) } finally { setSimulating(false) }
   }
   return <>
-    <PanelHeader icon={<Sparkles size={16} />} title="ASK NWIS · WHAT-IF SIMULATOR" meta="DETERMINISTIC + LLM" />
+    <PanelHeader icon={<Sparkles size={16} />} title={t('askWhatif')} meta={t('detLlm')} />
     <div className="whatif-controls">
-      <div className="whatif-title"><Zap size={13} /> Transparent what-if — adjust to see risk recalc before asking LLM</div>
+      <div className="whatif-title"><Zap size={13} /> {t('whatifTitle')}</div>
       <div className="whatif-sliders">
-        <label><span>MUD WEIGHT Δ</span><input type="range" min={-0.6} max={0.6} step={0.1} value={mudDelta} onChange={e => setMudDelta(parseFloat(e.target.value))} /><strong>{mudDelta > 0 ? '+' : ''}{mudDelta.toFixed(1)} ppg</strong><small>base {baseMud !== null ? `${baseMud} ppg` : value(document.report.mud_weight)}</small></label>
-        <label><span>FLOW RATE Δ</span><input type="range" min={-20} max={20} step={5} value={flowDelta} onChange={e => setFlowDelta(parseInt(e.target.value))} /><strong>{flowDelta > 0 ? '+' : ''}{flowDelta}%</strong><small>from current</small></label>
-        <label><span>WOB Δ</span><input type="range" min={-15} max={15} step={5} value={wobDelta} onChange={e => setWobDelta(parseInt(e.target.value))} /><strong>{wobDelta > 0 ? '+' : ''}{wobDelta}%</strong><small>weight on bit</small></label>
+        <label><span>{t('mudD')}</span><input type="range" min={-0.6} max={0.6} step={0.1} value={mudDelta} onChange={e => setMudDelta(parseFloat(e.target.value))} /><strong>{mudDelta > 0 ? '+' : ''}{mudDelta.toFixed(1)} ppg</strong><small>{t('baseMw', { v: baseMud !== null ? `${baseMud} ppg` : value(document.report.mud_weight, '', t('notFound')) })}</small></label>
+        <label><span>{t('flowD')}</span><input type="range" min={-20} max={20} step={5} value={flowDelta} onChange={e => setFlowDelta(parseInt(e.target.value))} /><strong>{flowDelta > 0 ? '+' : ''}{flowDelta}%</strong><small>{t('fromCurrent')}</small></label>
+        <label><span>{t('wobD')}</span><input type="range" min={-15} max={15} step={5} value={wobDelta} onChange={e => setWobDelta(parseInt(e.target.value))} /><strong>{wobDelta > 0 ? '+' : ''}{wobDelta}%</strong><small>{t('wobBit')}</small></label>
       </div>
-      {hasWhatIf && <button className="whatif-reset" onClick={() => { setMudDelta(0); setFlowDelta(0); setWobDelta(0); setWhatIfAnswer('') }}>Reset scenario</button>}
+      {hasWhatIf && <button className="whatif-reset" onClick={() => { setMudDelta(0); setFlowDelta(0); setWobDelta(0); setWhatIfAnswer('') }}>{t('resetScenario')}</button>}
       {document.report.risks.length > 0 && (
         <div className="whatif-table-wrap">
           <table className="whatif-table">
-            <thead><tr><th>Risk</th><th>Base</th><th>What-if</th><th>Δ</th><th>Trend</th></tr></thead>
-            <tbody>{whatIfRisks.slice(0, 6).map(r => <tr key={r.label}><td title={r.evidence}>{r.label}</td><td>{r.base}%</td><td className={r.delta > 4 ? 'up' : r.delta < -4 ? 'down' : ''}>{r.adjusted}%</td><td className={r.delta > 0 ? 'up' : r.delta < 0 ? 'down' : ''}>{r.delta > 0 ? '+' : ''}{r.delta}%</td><td><span className={`trend-chip ${r.trend}`}>{r.trend}</span></td></tr>)}</tbody>
+            <thead><tr><th>{t('riskCol')}</th><th>{t('baseCol')}</th><th>{t('whatifCol')}</th><th>{t('deltaCol')}</th><th>{t('trendCol')}</th></tr></thead>
+            <tbody>{whatIfRisks.slice(0, 6).map(r => <tr key={r.label}><td title={r.evidence}>{r.label}</td><td>{r.base}%</td><td className={r.delta > 4 ? 'up' : r.delta < -4 ? 'down' : ''}>{r.adjusted}%</td><td className={r.delta > 0 ? 'up' : r.delta < 0 ? 'down' : ''}>{r.delta > 0 ? '+' : ''}{r.delta}%</td><td><span className={`trend-chip ${r.trend}`}>{r.trend === 'rising' ? t('trendRising') : r.trend === 'falling' ? t('trendFalling') : t('trendSteady')}</span></td></tr>)}</tbody>
           </table>
-          <small className="whatif-formula">Rule: loss +18·Δmud+0.18·Δflow · kick −22·Δmud · stuck +12·Δmud−0.12·Δflow+0.14·Δwob · clamped 5–95. LLM explains evidence, does not invent scores.</small>
+          <small className="whatif-formula">{t('formula')}</small>
         </div>
       )}
-      {!document.report.risks.length && <small className="whatif-empty">No risks extracted — what-if will use event evidence instead. Upload a DDR with risk sections for full simulation.</small>}
-      <button className="whatif-sim-btn" onClick={simulate} disabled={simulating}><BrainCircuit size={14} /> {simulating ? 'SIMULATING…' : hasWhatIf ? 'SIMULATE & EXPLAIN WITH EVIDENCE' : 'EXPLAIN BASE RISKS'}</button>
-      {whatIfAnswer && <div className="whatif-answer"><div className="prediction-result-head"><span className="result-chip"><BrainCircuit size={13} /> GROQ · WHAT-IF</span><button onClick={() => setWhatIfAnswer('')} aria-label="Close"><X size={14} /></button></div><p className="ai-answer">{whatIfAnswer}</p></div>}
+      {!document.report.risks.length && <small className="whatif-empty">{t('noRisksWhatif')}</small>}
+      <button className="whatif-sim-btn" onClick={simulate} disabled={simulating}><BrainCircuit size={14} /> {simulating ? t('simulating') : hasWhatIf ? t('simBtn') : t('explainBtn')}</button>
+      {whatIfAnswer && <div className="whatif-answer"><div className="prediction-result-head"><span className="result-chip"><BrainCircuit size={13} /> {t('groqWhatif')}</span><button onClick={() => setWhatIfAnswer('')} aria-label={t('close')}><X size={14} /></button></div><p className="ai-answer">{whatIfAnswer}</p></div>}
     </div>
-    {answer ? <div className="prediction-result"><div className="prediction-result-head"><span className="result-chip"><BrainCircuit size={13} /> GROQ ANALYSIS</span><button onClick={() => setAnswer('')} aria-label="Close answer"><X size={14} /></button></div><h3>{question}</h3><p className="ai-answer">{answer}</p></div> : <>
-      <p className="prediction-intro">Ask a free-form drilling question. Constrained to uploaded evidence + what-if scores above.</p>
-      <form className="ask-form" onSubmit={ask}><textarea value={question} onChange={(event) => setQuestion(event.target.value)} placeholder="Ask about a depth, event, formation, mud property, or operational decision…" /><button type="submit" disabled={asking}><Send size={15} /> {asking ? 'ANALYSING…' : 'ASK NWIS'}</button></form>
+    {answer ? <div className="prediction-result"><div className="prediction-result-head"><span className="result-chip"><BrainCircuit size={13} /> {t('groqAnalysis')}</span><button onClick={() => setAnswer('')} aria-label={t('closeAnswer')}><X size={14} /></button></div><h3>{question}</h3><p className="ai-answer">{answer}</p></div> : <>
+      <p className="prediction-intro">{t('askIntro')}</p>
+      <form className="ask-form" onSubmit={ask}><textarea value={question} onChange={(event) => setQuestion(event.target.value)} placeholder={t('askPh')} /><button type="submit" disabled={asking}><Send size={15} /> {asking ? t('analysing') : t('askBtn')}</button></form>
     </>}
   </>
 }
 
 export default function App() {
-  const [view, setView] = useState<View>('command'); const [sidebarOpen, setSidebarOpen] = useState(true); const [documents, setDocuments] = useState<IndexedDocument[]>([]); const [activeName, setActiveName] = useState<string | null>(null); const [processing, setProcessing] = useState(false); const [progress, setProgress] = useState(0); const [status, setStatus] = useState('No document indexed'); const [error, setError] = useState(''); const [question, setQuestion] = useState(''); const [dragOver, setDragOver] = useState(false); const [fullscreen, setFullscreen] = useState(false)
+  const { t } = useLang()
+  const um = t('unitM'); const nf = t('notFound')
+  const [view, setView] = useState<View>('command'); const [sidebarOpen, setSidebarOpen] = useState(true); const [documents, setDocuments] = useState<IndexedDocument[]>([]); const [activeName, setActiveName] = useState<string | null>(null); const [processing, setProcessing] = useState(false); const [progress, setProgress] = useState(0); const [statusKey, setStatusKey] = useState<StrKey>('statusInit'); const [statusVars, setStatusVars] = useState<Record<string, string | number>>({}); const status = t(statusKey, statusVars); const [error, setError] = useState(''); const [question, setQuestion] = useState(''); const [dragOver, setDragOver] = useState(false); const [fullscreen, setFullscreen] = useState(false)
   const [searchQuery, setSearchQuery] = useState(''); const [searchKind, setSearchKind] = useState<SearchKind>('all'); const [searchFormation, setSearchFormation] = useState('all'); const [searchSeverity, setSearchSeverity] = useState('all'); const [searchOpen, setSearchOpen] = useState(false)
   const searchRef = useRef<HTMLDivElement>(null)
   const searchFormationOptions = useMemo(() => { const s = new Set<string>(); for (const d of documents) { if (d.report.formation) s.add(d.report.formation); for (const f of d.report.formations || []) if (f.name) s.add(f.name) } return [...s] }, [documents])
@@ -862,16 +902,16 @@ export default function App() {
         // only restore if local is empty to avoid overwriting fresh ingest
         setDocuments(prev => prev.length === 0 ? restored : prev)
         setActiveName(prev => prev ?? restored[0]?.name ?? null)
-        if (restored.length) setStatus(`Restored ${restored.length} document(s) from Supabase`)
+        if (restored.length) { setStatusKey('statusRestored'); setStatusVars({ count: restored.length }) }
       } catch (e) { console.warn('[supabase] restore failed', e) }
     })()
   }, [])
   async function ingestFile(file: File) {
     // allow re-ingesting same name: replace existing entry
-    setProcessing(true); setProgress(1); setStatus(`Opening ${file.name}`); setView('documents')
+    setProcessing(true); setProgress(1); setStatusKey('statusOpening'); setStatusVars({ name: file.name }); setView('documents')
     if (window.matchMedia('(max-width: 760px)').matches) setSidebarOpen(false)
     try {
-      const { analysis, pages } = await analyseDocument(file, (nextProgress, nextStatus) => { setProgress(nextProgress); setStatus(nextStatus) })
+      const { analysis, pages } = await analyseDocument(file, (nextProgress, nextKey, nextVars) => { setProgress(nextProgress); setStatusKey(nextKey); setStatusVars(nextVars ?? {}) })
       const url = URL.createObjectURL(file)
       // revoke previous url for same name if exists
       const prev = documentUrlMapRef.current.get(file.name); if (prev) URL.revokeObjectURL(prev)
@@ -882,14 +922,14 @@ export default function App() {
         return [...others, next]
       })
       setActiveName(file.name)
-      setStatus(`Indexed ${analysis.report.sections.length} factual sections from ${pages} pages`)
+      setStatusKey('indexedMsg'); setStatusVars({ sections: analysis.report.sections.length, pages })
       // persist to Supabase (non-blocking, graceful fallback)
       if (isSupabaseConfigured) {
         const rep = analysis.report as unknown as Report
         upsertWellFromReport(rep as never).catch(() => {})
         saveDocumentToSupabase({ name: file.name, report: analysis.report, corpus: analysis.corpus, embeddingModel: analysis.embeddingModel, documentVector: analysis.documentVector, segments: analysis.segments, embeddings: analysis.embeddings, pages }).then(r => {
           if (r.error) console.warn('[supabase] save failed', r.error)
-          else setStatus(s => s + ' · persisted to Supabase')
+          else { setStatusKey('indexedPersisted'); setStatusVars({ sections: analysis.report.sections.length, pages }) }
         }).catch(e => console.warn('[supabase] save error', e))
         // try storage upload (best-effort)
         if (supabase) {
@@ -901,7 +941,7 @@ export default function App() {
           }).catch(() => {})
         }
       }
-    } catch (uploadError) { setError(previous => [previous, `${file.name}: ${uploadError instanceof Error ? uploadError.message : 'Document processing failed.'}`].filter(Boolean).join(' • ')); setStatus('Document processing failed') } finally { setProgress(100) }
+    } catch (uploadError) { const msg = uploadError instanceof L10nError ? t(uploadError.key, uploadError.vars) : uploadError instanceof Error && uploadError.message ? uploadError.message : t('statusFailed'); setError(previous => [previous, t('docFailedWith', { name: file.name, err: msg })].filter(Boolean).join(' • ')); setStatusKey('statusFailed'); setStatusVars({}) } finally { setProgress(100) }
   }
   async function handleUpload(event: ChangeEvent<HTMLInputElement>) { const files = event.target.files; if (!files || !files.length) return; await ingestFiles(files); event.target.value = '' }
   // multi-file drag support
@@ -920,36 +960,36 @@ export default function App() {
     } finally { ingestingRef.current = false; setProcessing(false) }
   }
   const report = document?.report
-  const navItems: [View, ReactNode, string][] = [['command', <Crosshair size={17} />, 'Command Center'], ['dive', <Waves size={17} />, 'Well Dive'], ['documents', <FileScan size={17} />, 'Documents'], ['embeddings', <Network size={17} />, 'Embedding Explorer'], ['prediction', <BrainCircuit size={17} />, 'Prediction Mode']]
+  const navItems: [View, ReactNode, string][] = [['command', <Crosshair size={17} />, t('navCommand')], ['dive', <Waves size={17} />, t('navDive')], ['documents', <FileScan size={17} />, t('navDocs')], ['embeddings', <Network size={17} />, t('navEmbed')], ['prediction', <BrainCircuit size={17} />, t('navPredict')]]
   function renderView() {
     if (documents.length === 0) return processing ? null : <EmptyWorkspace view={view} />
     if (!document || !report) return <EmptyWorkspace view={view} />
     if (view === 'documents') return <div className="view-grid documents-view"><div className="panel document-panel"><DocumentPanel document={document} processing={processing} progress={progress} status={status} /></div><div className="panel activity-panel"><StreamPanel document={document} status={status} /></div></div>
     if (view === 'embeddings') {
       const activeDoc = document
-      return <div className="view-grid embeddings-view"><div className="panel embeddings-panel"><EmbeddingPanel documents={documents} /></div><div className="panel panel-copy"><PanelHeader icon={<MapPinned size={16} />} title="DRILLING SITES" meta={`${documents.length} SITES INDEXED`} /><h2>{activeDoc.report.well_name ?? activeDoc.name}</h2><p>{activeDoc.report.lease_block ?? 'No lease/block'} · {activeDoc.report.formation ?? 'Formation not stated'} · Click a point to switch active site. Similar sites cluster closer.</p><div className="linked-well-list">{documents.map((doc) => {
+      return <div className="view-grid embeddings-view"><div className="panel embeddings-panel"><EmbeddingPanel documents={documents} /></div><div className="panel panel-copy"><PanelHeader icon={<MapPinned size={16} />} title={t('drillSites')} meta={t('sitesIdxMeta', { count: documents.length })} /><h2>{activeDoc.report.well_name ?? activeDoc.name}</h2><p>{activeDoc.report.lease_block ?? t('leaseNA')} · {activeDoc.report.formation ?? t('formationNA2')} · {t('clickPoint')}</p><div className="linked-well-list">{documents.map((doc) => {
         const isActive = doc.name === activeDoc.name
-        return <button key={doc.name} className={isActive ? 'selected' : ''} onClick={() => setActiveName(doc.name)}><span>{doc.report.well_name ?? doc.name}</span><small>{value(doc.report.current_md, ' m')} · {doc.report.formation ?? '—'} · {doc.report.lease_block ?? ''}</small><ArrowUpRight size={14} /></button>
-      })}</div><p style={{ margin: '10px 17px', fontSize: 8, color: '#9a9e9c' }}>{documents[0]?.embeddingModel ?? ''} · cosine similarity · semanticProjection (PCA Gram)</p></div></div>
+        return <button key={doc.name} className={isActive ? 'selected' : ''} onClick={() => setActiveName(doc.name)}><span>{doc.report.well_name ?? doc.name}</span><small>{value(doc.report.current_md, um, nf)} · {doc.report.formation ?? '—'} · {doc.report.lease_block ?? ''}</small><ArrowUpRight size={14} /></button>
+      })}</div><p style={{ margin: '10px 17px', fontSize: 8, color: '#9a9e9c' }}>{t('modelNote', { model: documents[0]?.embeddingModel ?? '' })}</p></div></div>
     }
-    if (view === 'prediction') return <div className="view-grid prediction-view"><div className="panel prediction-panel large"><PredictionPanel document={document} question={question} setQuestion={setQuestion} /></div><div className="panel panel-copy"><PanelHeader icon={<Bell size={16} />} title="EXTRACTED EVENTS" meta={`${report.events.length} FOUND`} /><div className="alert-log">{report.events.length ? report.events.map((event, index) => <span key={`${event.type}-${index}`}><b>{event.time || '—'}</b>{event.type}{event.depth === null ? '' : ` · ${event.depth.toLocaleString()} m`}</span>) : <span>No operational events found.</span>}</div></div></div>
-    if (view === 'dive') return <div className="view-grid dive-view"><div className="panel dive-panel"><PanelHeader icon={<Waves size={16} />} title="WELL DIVE — PARALLAX SHAFT" meta={`${report.well_name || 'ACTIVE WELL'} · ${value(report.current_md, ' m')} · ${report.formation || 'FORMATION'}`} /><WellDive report={report as never} /></div><div className="panel panel-copy dive-copy"><PanelHeader icon={<Activity size={16} />} title="DIVE CONTEXT" meta={`${report.formations?.length || 0} FORMATIONS · ${report.events.length} EVENTS`} /><div className="dive-stats"><span><small>CURRENT FORMATION</small><b>{report.formation || 'Not found'}</b></span><span><small>DEEPEST MD</small><b>{value(report.current_md, ' m')}</b></span><span><small>TVD</small><b>{value(report.current_tvd, ' m')}</b></span><span><small>MUD WEIGHT</small><b>{value(report.mud_weight)}</b></span></div><div className="formation-list" style={{ margin: '14px 17px' }}>{(report.formations?.length ? report.formations : report.formation ? [{ name: report.formation, top_md: null, bottom_md: null }] : []).map((f, i) => <div key={`${f.name}-${i}`}><strong>{f.name}</strong><span>{f.top_md === null && f.bottom_md === null ? 'Depth interval not stated' : `${value(f.top_md, ' m')} – ${value(f.bottom_md, ' m')}`}</span></div>)}</div><div className="dive-events"><b>Depth-tagged events</b>{report.events.filter(e => e.depth !== null).slice(0, 5).map((e, i) => <span key={i}><small>{e.depth} m</small><strong>{e.type}</strong><em>{e.severity || '—'}</em></span>)}{report.events.filter(e => e.depth !== null).length === 0 && <small style={{ color: '#9a9e9c' }}>No depth-tagged events in this report</small>}</div><button className="coral-action" onClick={() => setView('command')} style={{ marginTop: 12 }}><Crosshair size={14} /> Back to Command Center</button></div></div>
-    return <><div className="hero-grid"><div className={`panel map-panel ${fullscreen ? 'map-panel-fullscreen' : ''}`}><PanelHeader icon={<MapPinned size={16} />} title="DOCUMENT WELL LOCATIONS" meta={report.latitude === null || report.longitude === null ? 'COORDINATES NOT FOUND' : `${1 + report.offset_wells.filter((well) => well.latitude !== null && well.longitude !== null).length} MAPPED`} /><FieldMap report={report} fullscreen={fullscreen} onToggleFullscreen={toggleFullscreen} /></div><div className="panel depth-panel"><DepthPanel report={report} onOpenDive={() => setView('dive')} /></div><div className="panel document-panel"><DocumentPanel document={document} processing={processing} progress={progress} status={status} /></div></div><RiskRow risks={report.risks || []} events={report.events || []} openPrediction={() => setView('prediction')} /><TelemetryPanel report={report} /><div className="lower-grid"><div className="panel activity-panel"><StreamPanel document={document} status={status} /></div><div className="panel prediction-panel"><PredictionPanel document={document} question={question} setQuestion={setQuestion} /></div></div></>
+    if (view === 'prediction') return <div className="view-grid prediction-view"><div className="panel prediction-panel large"><PredictionPanel document={document} question={question} setQuestion={setQuestion} /></div><div className="panel panel-copy"><PanelHeader icon={<Bell size={16} />} title={t('extractEvents')} meta={t('foundMeta', { count: report.events.length })} /><div className="alert-log">{report.events.length ? report.events.map((event, index) => <span key={`${event.type}-${index}`}><b>{event.time || '—'}</b>{event.type}{event.depth === null ? '' : ` · ${event.depth.toLocaleString()}${um}`}</span>) : <span>{t('noLeaseEvents')}</span>}</div></div></div>
+    if (view === 'dive') return <div className="view-grid dive-view"><div className="panel dive-panel"><PanelHeader icon={<Waves size={16} />} title={t('diveTitle')} meta={`${report.well_name || t('activeWell')} · ${value(report.current_md, um, nf)} · ${report.formation || t('formationLbl')}`} /><WellDive report={report as never} /></div><div className="panel panel-copy dive-copy"><PanelHeader icon={<Activity size={16} />} title={t('diveCtx')} meta={t('formationsMeta', { f: report.formations?.length || 0, e: report.events.length })} /><div className="dive-stats"><span><small>{t('curFormation')}</small><b>{report.formation || t('notFoundShort')}</b></span><span><small>{t('deepestMd')}</small><b>{value(report.current_md, um, nf)}</b></span><span><small>{t('tvd')}</small><b>{value(report.current_tvd, um, nf)}</b></span><span><small>{t('mudWLbl')}</small><b>{value(report.mud_weight, '', nf)}</b></span></div><div className="formation-list" style={{ margin: '14px 17px' }}>{(report.formations?.length ? report.formations : report.formation ? [{ name: report.formation, top_md: null, bottom_md: null }] : []).map((f, i) => <div key={`${f.name}-${i}`}><strong>{f.name}</strong><span>{f.top_md === null && f.bottom_md === null ? t('depthIntervalNA') : `${value(f.top_md, um, nf)} – ${value(f.bottom_md, um, nf)}`}</span></div>)}</div><div className="dive-events"><b>{t('depthTagged')}</b>{report.events.filter(e => e.depth !== null).slice(0, 5).map((e, i) => <span key={i}><small>{e.depth}{um}</small><strong>{e.type}</strong><em>{e.severity || '—'}</em></span>)}{report.events.filter(e => e.depth !== null).length === 0 && <small style={{ color: '#9a9e9c' }}>{t('noDepthTagged')}</small>}</div><button className="coral-action" onClick={() => setView('command')} style={{ marginTop: 12 }}><Crosshair size={14} /> {t('backCommand')}</button></div></div>
+    return <><div className="hero-grid"><div className={`panel map-panel ${fullscreen ? 'map-panel-fullscreen' : ''}`}><PanelHeader icon={<MapPinned size={16} />} title={t('docWellLoc')} meta={report.latitude === null || report.longitude === null ? t('coordsNA') : t('mapped', { count: 1 + report.offset_wells.filter((well) => well.latitude !== null && well.longitude !== null).length })} /><FieldMap report={report} fullscreen={fullscreen} onToggleFullscreen={toggleFullscreen} /></div><div className="panel depth-panel"><DepthPanel report={report} onOpenDive={() => setView('dive')} /></div><div className="panel document-panel"><DocumentPanel document={document} processing={processing} progress={progress} status={status} /></div></div><RiskRow risks={report.risks || []} events={report.events || []} openPrediction={() => setView('prediction')} /><TelemetryPanel report={report} /><div className="lower-grid"><div className="panel activity-panel"><StreamPanel document={document} status={status} /></div><div className="panel prediction-panel"><PredictionPanel document={document} question={question} setQuestion={setQuestion} /></div></div></>
   }
-  const heading = view === 'command' ? 'Operational evidence from uploaded documents.' : view === 'dive' ? 'Plunge through the well — parallax strata, drill, and events.' : view === 'documents' ? 'Make every report searchable.' : view === 'embeddings' ? 'Explore this document’s evidence.' : 'Ask against indexed evidence.'
+  const heading = view === 'command' ? t('headCommand') : view === 'dive' ? t('headDive') : view === 'documents' ? t('headDocs') : view === 'embeddings' ? t('headEmbed') : t('headPredict')
   function onDragOver(event: React.DragEvent) { event.preventDefault(); if (!dragOver) setDragOver(true) }
   function onDragLeave(event: React.DragEvent) { if (!(event.currentTarget as HTMLElement).contains(event.relatedTarget as Node)) setDragOver(false) }
   async function onDrop(event: React.DragEvent) { event.preventDefault(); setDragOver(false); const files = event.dataTransfer.files; if (files && files.length) await ingestFiles(files) }
-  return <div className={`app-shell ${sidebarOpen ? '' : 'sidebar-collapsed'}` + (dragOver ? ' drag-active' : '')} onDragOver={onDragOver} onDragLeave={onDragLeave} onDrop={onDrop}><header className="topbar"><button className="sidebar-toggle" onClick={() => setSidebarOpen((open) => !open)} aria-label={sidebarOpen ? 'Collapse navigation' : 'Open navigation'}>{sidebarOpen ? <PanelLeftClose size={18} /> : <Menu size={18} />}</button><div className="brand-lockup"><div className="brand-mark">N°</div><div><div className="brand-title">NWIS</div><div className="brand-subtitle">NEARBY WELLS INTELLIGENCE</div></div></div><div className="top-search" ref={searchRef} style={{ position: 'relative' }}><Search size={15} /><input value={searchQuery} onChange={e => { setSearchQuery(e.target.value); setSearchOpen(true) }} onFocus={() => setSearchOpen(true)} placeholder={documents.length ? `Search ${documents.length} site(s) — keyword + filters…` : 'Search indexed document evidence…'} style={{ flex: 1, border: 0, outline: 'none', background: 'transparent', fontSize: 10, color: '#121417' }} />{searchQuery && <button onClick={() => { setSearchQuery(''); setSearchOpen(false) }} style={{ border: 0, background: 'transparent', cursor: 'pointer', color: '#aaa' }}><X size={12} /></button>}<div className="search-filters" style={{ display: searchOpen && documents.length ? 'flex' : 'none' }}><select value={searchKind} onChange={e => setSearchKind(e.target.value as SearchKind)}><option value="all">All</option><option value="section">Sections</option><option value="event">Events</option><option value="risk">Risks</option><option value="well">Wells</option></select><select value={searchFormation} onChange={e => setSearchFormation(e.target.value)}><option value="all">All formations</option>{searchFormationOptions.map(n => <option key={n} value={n}>{n}</option>)}</select><select value={searchSeverity} onChange={e => setSearchSeverity(e.target.value)}><option value="all">All severity</option><option value="high">high</option><option value="medium">medium</option><option value="low">low</option></select><span style={{ fontSize: 8, color: '#58a9a3', fontWeight: 800 }}>{searchResults.length} hits</span></div>{searchOpen && (searchQuery.trim() || searchKind !== 'all' || searchFormation !== 'all' || searchSeverity !== 'all') && (
+  return <div className={`app-shell ${sidebarOpen ? '' : 'sidebar-collapsed'}` + (dragOver ? ' drag-active' : '')} onDragOver={onDragOver} onDragLeave={onDragLeave} onDrop={onDrop}><header className="topbar"><button className="sidebar-toggle" onClick={() => setSidebarOpen((open) => !open)} aria-label={sidebarOpen ? t('collapseNav') : t('openNav')}>{sidebarOpen ? <PanelLeftClose size={18} /> : <Menu size={18} />}</button><div className="brand-lockup"><div className="brand-mark">N°</div><div><div className="brand-title">{t('brandTitle')}</div><div className="brand-subtitle">{t('brandSubtitle')}</div></div></div><div className="top-search" ref={searchRef} style={{ position: 'relative' }}><Search size={15} /><input value={searchQuery} onChange={e => { setSearchQuery(e.target.value); setSearchOpen(true) }} onFocus={() => setSearchOpen(true)} placeholder={documents.length ? t('searchPh', { count: documents.length }) : t('searchPhEmpty')} style={{ flex: 1, border: 0, outline: 'none', background: 'transparent', fontSize: 10, color: '#121417' }} />{searchQuery && <button aria-label={t('clearSearch')} onClick={() => { setSearchQuery(''); setSearchOpen(false) }} style={{ border: 0, background: 'transparent', cursor: 'pointer', color: '#aaa' }}><X size={12} /></button>}<div className="search-filters" style={{ display: searchOpen && documents.length ? 'flex' : 'none' }}><select value={searchKind} onChange={e => setSearchKind(e.target.value as SearchKind)}><option value="all">{t('fAll')}</option><option value="section">{t('fSections')}</option><option value="event">{t('fEvents')}</option><option value="risk">{t('fRisks')}</option><option value="well">{t('fWells')}</option></select><select value={searchFormation} onChange={e => setSearchFormation(e.target.value)}><option value="all">{t('fAllFormations')}</option>{searchFormationOptions.map(n => <option key={n} value={n}>{n}</option>)}</select><select value={searchSeverity} onChange={e => setSearchSeverity(e.target.value)}><option value="all">{t('fAllSeverity')}</option><option value="high">{t('sevHigh')}</option><option value="medium">{t('sevMedium')}</option><option value="low">{t('sevLow')}</option></select><span style={{ fontSize: 8, color: '#58a9a3', fontWeight: 800 }}>{t('hits', { count: searchResults.length })}</span></div>{searchOpen && (searchQuery.trim() || searchKind !== 'all' || searchFormation !== 'all' || searchSeverity !== 'all') && (
         <div className="search-dropdown">
-          {searchResults.length === 0 ? <div className="search-empty">No matches — try broader filters or upload more DDRs</div> : searchResults.map(r => (
+          {searchResults.length === 0 ? <div className="search-empty">{t('searchNoMatches')}</div> : searchResults.map(r => (
             <button key={r.id} className="search-item" onClick={() => { setActiveName(r.docName); setSearchOpen(false); if (r.kind === 'well' || r.kind === 'section') setView('documents'); else if (r.kind === 'risk' || r.kind === 'event') setView('prediction'); else setView('command') }}>
-              <span className={`search-kind ${r.kind}`}>{r.kind}</span>
-              <div style={{ minWidth: 0 }}><strong>{r.title}</strong><span>{r.snippet}</span><small>{r.wellName || r.docName} {r.formation ? `· ${r.formation}` : ''} {r.depth ? `· ${r.depth} m` : ''}</small></div>
+              <span className={`search-kind ${r.kind}`}>{r.kind === 'section' ? t('fSections') : r.kind === 'event' ? t('fEvents') : r.kind === 'risk' ? t('fRisks') : r.kind === 'well' ? t('fWells') : t('fAll')}</span>
+              <div style={{ minWidth: 0 }}><strong>{r.title}</strong><span>{r.snippet}</span><small>{r.wellName || r.docName} {r.formation ? `· ${r.formation}` : ''} {r.depth ? `· ${r.depth}${um}` : ''}</small></div>
               <ArrowUpRight size={12} />
             </button>
           ))}
-          <div className="search-hint">Hybrid: keyword score + formation/severity filter · Vector rank via token overlap + embedding cosine (explorer)</div>
+          <div className="search-hint">{t('searchHint')}</div>
         </div>
-              )}</div><div className="top-actions"><span className="online-pill"><i /> {processing ? `PROCESSING ${progress}%` : documents.length ? `${documents.length} SITE(S) INDEXED` : 'AWAITING DOCUMENT'}</span><span className="online-pill" style={isSupabaseConfigured ? { color: '#2a9d8f', border: '1px solid #cde5e1' } : { color: '#b0b1ae', border: '1px solid #ecece8' }}><i style={{ background: isSupabaseConfigured ? '#2a9d8f' : '#b0b1ae' }} /> {isSupabaseConfigured ? 'SUPABASE' : 'LOCAL'}</span><button aria-label="Notifications"><Bell size={17} /></button><button aria-label="Settings"><Settings2 size={17} /></button></div></header><div className="app-layout"><aside className="sidebar"><div className="sidebar-top"><span>WORKSPACE</span><button onClick={() => setSidebarOpen(false)} aria-label="Collapse sidebar"><PanelLeftClose size={15} /></button></div><nav>{navItems.map(([id, icon, label]) => <button key={id} className={view === id ? 'active' : ''} onClick={() => setView(id)}>{icon}<span>{label}</span></button>)}</nav><div className="sidebar-section"><span>ACTIVE WELL</span><button className="well-switch" onClick={() => setView('embeddings')}><strong>{report?.well_name || 'No well indexed'}</strong><small>{report ? `${report.formation || 'Formation not found'} · ${value(report.current_md, ' m')} · ${documents.length} site(s)` : 'Upload drilling documents'} </small><ChevronDown size={14} /></button>{documents.length > 1 && <div style={{ display: 'grid', gap: 4, marginTop: 6, maxHeight: 132, overflowY: 'auto' }}>{documents.map((doc) => <button key={doc.name} onClick={() => setActiveName(doc.name)} style={{ textAlign: 'left', padding: '6px 8px', borderRadius: 7, border: activeName===doc.name || (!activeName && doc.name===document?.name) ? '1px solid #f0c1b4' : '1px solid var(--line)', background: activeName===doc.name || (!activeName && doc.name===document?.name) ? 'var(--coral-soft)' : 'white', fontSize: 9 }}><strong style={{ display:'block', fontSize: 9 }}>{doc.report.well_name ?? doc.name}</strong><small style={{ color: '#8a8c89' }}>{doc.report.formation ?? '—'} · {value(doc.report.current_md, ' m')}</small></button>)}</div>}</div><div className="sidebar-section"><span>QUICK ACTIONS</span><label className="sidebar-upload" title="Select a PDF or image drilling report"><Upload size={15} /> Ingest document(s)<input type="file" disabled={processing} multiple accept=".pdf,.png,.jpg,.jpeg,.bmp,.webp" onChange={handleUpload} /></label><button disabled={!document} onClick={() => setView('prediction')}><Sparkles size={15} /> Ask NWIS</button></div><div className="sidebar-foot"><span><i className="online-dot" /> {processing ? status : document ? 'Index ready' : 'No dataset loaded'}</span><small>{document?.name || 'NO DOCUMENT'}</small></div></aside><main className="main-content"><div className="page-heading"><div><span className="eyebrow">{view === 'command' ? 'FIELD OVERVIEW' : view === 'documents' ? 'DOCUMENT INTELLIGENCE' : view === 'embeddings' ? 'EVIDENCE GRAPH' : 'DECISION SUPPORT'}</span><h1>{heading}</h1></div><span className="date-stamp">{report?.report_date || 'DATE NOT FOUND'}{report?.report_number ? ` / ${report.report_number}` : ''}</span></div>{error && <div className="pipeline-error"><AlertTriangle size={15} />{error}</div>}{processing && <section className="processing-loader" role="status" aria-live="polite"><LoaderCircle className="ocr-spinner" size={24} /><div><strong>Processing document</strong><span>{processingFile}</span><p>{status}</p><progress max={100} value={progress} aria-label="Document processing stages" /><small>Progress follows completed stages. OCR may take several minutes per page.</small></div></section>}<div className="workspace" aria-busy={processing}>{renderView()}</div></main></div>{dragOver && <div className="drag-overlay"><Upload size={22} /><span>Drop DDRs / WCRs to ingest (multi)</span></div>}<div className="status-footer"><span><i className="online-dot" /> {processing ? status : document ? 'INDEXED FROM UPLOADED DOCUMENT' : 'AWAITING UPLOAD'}</span><span><FileText size={12} /> {document?.name || 'No document indexed'}</span><span>{document ? `${document.report.sections.length} sections · ${document.report.events.length} events · ${document.embeddings.length} vectors` : 'No operational data loaded'}</span><CircleHelp size={13} /></div></div>
+              )}</div><div className="top-actions"><span className="online-pill"><i /> {processing ? t('processing', { progress }) : documents.length ? t('sitesIndexed', { count: documents.length }) : t('awaitingDoc')}</span><span className="online-pill" style={isSupabaseConfigured ? { color: '#2a9d8f', border: '1px solid #cde5e1' } : { color: '#b0b1ae', border: '1px solid #ecece8' }}><i style={{ background: isSupabaseConfigured ? '#2a9d8f' : '#b0b1ae' }} /> {isSupabaseConfigured ? t('supabase') : t('local')}</span><LanguageToggle /><button aria-label={t('notifications')}><Bell size={17} /></button><button aria-label={t('settings')}><Settings2 size={17} /></button></div></header><div className="app-layout"><aside className="sidebar"><div className="sidebar-top"><span>{t('workspace')}</span><button onClick={() => setSidebarOpen(false)} aria-label={t('collapseSidebar')}><PanelLeftClose size={15} /></button></div><nav>{navItems.map(([id, icon, label]) => <button key={id} className={view === id ? 'active' : ''} onClick={() => setView(id)}>{icon}<span>{label}</span></button>)}</nav><div className="sidebar-section"><span>{t('activeWell')}</span><button className="well-switch" onClick={() => setView('embeddings')}><strong>{report?.well_name || t('noWell')}</strong><small>{report ? `${report.formation || t('formationNFFull')} · ${value(report.current_md, um, nf)} · ${t('sitesUnit', { count: documents.length })}` : t('uploadDocs')} </small><ChevronDown size={14} /></button>{documents.length > 1 && <div style={{ display: 'grid', gap: 4, marginTop: 6, maxHeight: 132, overflowY: 'auto' }}>{documents.map((doc) => <button key={doc.name} onClick={() => setActiveName(doc.name)} style={{ textAlign: 'left', padding: '6px 8px', borderRadius: 7, border: activeName===doc.name || (!activeName && doc.name===document?.name) ? '1px solid #f0c1b4' : '1px solid var(--line)', background: activeName===doc.name || (!activeName && doc.name===document?.name) ? 'var(--coral-soft)' : 'white', fontSize: 9 }}><strong style={{ display:'block', fontSize: 9 }}>{doc.report.well_name ?? doc.name}</strong><small style={{ color: '#8a8c89' }}>{doc.report.formation ?? '—'} · {value(doc.report.current_md, um, nf)}</small></button>)}</div>}</div><div className="sidebar-section"><span>{t('qa')}</span><label className="sidebar-upload" title={t('uploadTitle')}><Upload size={15} /> {t('ingestDocs')}<input type="file" disabled={processing} multiple accept=".pdf,.png,.jpg,.jpeg,.bmp,.webp" onChange={handleUpload} /></label><button disabled={!document} onClick={() => setView('prediction')}><Sparkles size={15} /> {t('askNwisSb')}</button></div><div className="sidebar-foot"><span><i className="online-dot" /> {processing ? status : document ? t('indexReady') : t('noDataset')}</span><small>{document?.name || t('noDocCaps')}</small></div></aside><main className="main-content"><div className="page-heading"><div><span className="eyebrow">{view === 'command' ? t('eyebrowField') : view === 'documents' ? t('docIntel') : view === 'embeddings' ? t('eyebrowGraph') : t('eyebrowDecision')}</span><h1>{heading}</h1></div><span className="date-stamp">{report?.report_date || t('dateNA')}{report?.report_number ? ` / ${report.report_number}` : ''}</span></div>{error && <div className="pipeline-error"><AlertTriangle size={15} />{error}</div>}{processing && <section className="processing-loader" role="status" aria-live="polite"><LoaderCircle className="ocr-spinner" size={24} /><div><strong>{t('procDoc')}</strong><span>{processingFile}</span><p>{status}</p><progress max={100} value={progress} aria-label={t('procStages')} /><small>{t('procNote')}</small></div></section>}<div className="workspace" aria-busy={processing}>{renderView()}</div></main></div>{dragOver && <div className="drag-overlay"><Upload size={22} /><span>{t('dropIngest')}</span></div>}<div className="status-footer"><span><i className="online-dot" /> {processing ? status : document ? t('indexedFrom') : t('awaitingUp')}</span><span><FileText size={12} /> {document?.name || t('noDocIdx')}</span><span>{document ? t('footerStats', { s: document.report.sections.length, e: document.report.events.length, v: document.embeddings.length }) : t('noData')}</span><CircleHelp size={13} /></div></div>
 }
