@@ -361,3 +361,66 @@ html, body, #root { width: 100%; height: 100%; overflow: hidden; }
 .dive-events em { color: #8a9e9c; font-size: 7px; font-weight: 700; text-align: right; text-transform: uppercase; }
 @media (max-width: 1100px) { .dive-view { grid-template-columns: minmax(0, 1fr) minmax(260px, .7fr); } .dive-panel .well-dive-chart { min-height: 440px; } }
 @media (max-width: 760px) { .dive-view { display: flex; flex-direction: column; } .dive-panel, .dive-copy { min-height: 0; } .dive-panel .well-dive-chart { min-height: 360px; } }
+
+.processing-loader { display: flex; gap: 16px; margin-bottom: 20px; padding: 22px; border: 1px solid var(--line); border-radius: 12px; background: #fff; color: var(--ink); }
+.processing-loader > svg { flex-shrink: 0; margin-top: 3px; color: var(--coral); }
+.processing-loader > div { flex: 1; min-width: 0; }
+.processing-loader strong { display: block; font-size: 16px; }
+.processing-loader span { display: block; margin-top: 5px; overflow-wrap: anywhere; font-size: 13px; }
+.processing-loader p { font-size: 13px; margin: 16px 0 8px; }
+.processing-loader progress { width: 100%; height: 8px; accent-color: var(--coral); }
+.processing-loader small { display: block; margin-top: 9px; color: #596764; font-size: 12px; line-height: 1.5; }
+.sidebar-upload:has(input:disabled) { opacity: .55; cursor: wait; }
+.sidebar-upload input:disabled { cursor: wait; }
+.ocr-spinner { animation: ocr-spin 1.2s linear infinite; }
+@keyframes ocr-spin { to { transform: rotate(360deg); } }
+@media (prefers-reduced-motion: reduce) { .ocr-spinner { animation: none; } }
+
+/* Well Dive — geological section and drill assembly */
+.well-dive { display: flex; flex-direction: column; min-height: 0; height: 100%; border-top: 0; background: #fff; }
+.well-dive-toolbar { min-height: 42px; display: flex; align-items: center; justify-content: space-between; padding: 7px 12px; border-bottom: 1px solid #dce7e5; background: #fbfcfb; }
+.well-dive-status { display: inline-flex; align-items: center; gap: 7px; color: #56847f; font-size: 7px; font-weight: 800; letter-spacing: .08em; }
+.well-dive-status i { width: 6px; height: 6px; border-radius: 50%; background: #55b8b2; box-shadow: 0 0 0 4px rgba(85,184,178,.13); }
+.well-dive-toolbar-actions { display: flex; gap: 6px; }
+.well-dive-toolbar-actions button { min-height: 28px; display: inline-flex; align-items: center; gap: 5px; padding: 0 10px; border: 1px solid #d8e3e1; border-radius: 8px; background: #fff; color: #58706d; font-size: 8px; font-weight: 750; cursor: pointer; }
+.well-dive-toolbar-actions button:hover, .well-dive-toolbar-actions button:focus-visible { border-color: #8fc9c4; color: #234a46; outline: none; }
+.well-dive-toolbar-actions button.playing { background: #1c292b; border-color: #1c292b; color: #fff; }
+.well-dive-scene { position: relative; flex: 1; min-height: 430px; overflow: hidden; isolation: isolate; background: #c8e8e5; }
+.well-dive-sky { position: absolute; inset: 0 0 62%; background: linear-gradient(104deg, #d2efec 0%, #a5ddd8 46%, #eff7f6 100%); }
+.well-dive-sky::after { content: ''; position: absolute; inset: 0; background: linear-gradient(90deg, transparent 0 49.5%, rgba(255,255,255,.48) 49.5% 50.5%, transparent 50.5%); opacity: .5; }
+.well-dive-strata { position: absolute; z-index: 1; left: 0; right: 0; top: 19%; bottom: -10px; display: flex; flex-direction: column; transition: transform .48s cubic-bezier(.16,1,.3,1); }
+.well-dive-band { position: relative; flex: 1 0 10%; min-height: 42px; overflow: hidden; border-top: 1px solid rgba(255,255,255,.32); }
+.well-dive-band > span { position: absolute; z-index: 3; left: 10%; top: 50%; display: grid; gap: 3px; transform: translateY(-50%); color: #213835; text-shadow: 0 1px rgba(255,255,255,.34); }
+.well-dive-band > span b { max-width: 150px; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; font-size: 9px; font-weight: 800; }
+.well-dive-band > span small { font-size: 7px; font-weight: 650; opacity: .77; }
+.well-dive-band::after { content: ''; position: absolute; inset: 0; opacity: .15; background: repeating-linear-gradient(164deg, transparent 0 11px, rgba(35,72,68,.42) 12px 13px, transparent 14px 27px); }
+.well-dive-band.tone-aquifer { background: #77c9c4; }.well-dive-band.tone-slate { background: #4f9695; }.well-dive-band.tone-coral { background: #ec7e66; }.well-dive-band.tone-ochre { background: #d69d4e; }.well-dive-band.tone-sand { background: #edbd58; }.well-dive-band.tone-clay { background: #a57b62; }
+.strata-fold { position: absolute; z-index: 2; left: -8%; width: 62%; height: 84%; transform: skewY(8deg) rotate(-3deg); background: rgba(255,255,255,.08); border-bottom: 1px solid rgba(34,64,61,.18); }
+.strata-fold-a { top: -25%; }.strata-fold-b { left: 42%; top: 34%; width: 70%; transform: skewY(-6deg) rotate(2deg); background: rgba(20,66,61,.08); }
+.well-dive-casing { position: absolute; z-index: 6; left: 50%; top: 0; bottom: 0; width: 104px; transform: translateX(-50%); background: linear-gradient(90deg, rgba(30,34,34,.68), #d5d8d7 8%, #636765 16%, #e9ebea 26%, #8e9290 35%, #f6f7f6 48%, #767a78 58%, #e8e9e8 72%, #696d6b 84%, #d9dcdb 94%, rgba(36,40,39,.7)); box-shadow: -14px 0 25px rgba(15,49,46,.14), 14px 0 25px rgba(15,49,46,.14); }
+.well-dive-casing::before { content: ''; position: absolute; inset: 0; opacity: .38; background: repeating-linear-gradient(90deg, transparent 0 4px, rgba(20,20,20,.45) 5px, rgba(255,255,255,.6) 6px 7px); }
+.casing-wall, .casing-rib, .drill-string, .drill-collar, .drill-bit { position: absolute; display: block; }
+.casing-wall { top: 0; bottom: 0; width: 8px; background: linear-gradient(90deg,#2e3231,#d2d5d4,#4a4e4c); box-shadow: 0 0 0 1px rgba(15,15,15,.35); }.casing-left { left: 16px; }.casing-right { right: 16px; }
+.casing-rib { top: 0; bottom: 0; width: 13px; opacity: .65; background: repeating-linear-gradient(0deg,#2f3332 0 2px,#b9bcba 2px 4px); }.casing-rib-left { left: 31px; }.casing-rib-right { right: 31px; }
+.drill-string { left: 50%; top: 0; bottom: 7%; width: 10px; transform: translateX(-50%); background: linear-gradient(90deg,#272a29,#c8cbc9 25%,#f2f3f2 46%,#535755 72%,#202322); box-shadow: 0 0 0 1px rgba(18,20,19,.62), 0 4px 12px rgba(0,0,0,.25); }
+.drill-collar { z-index: 3; left: 50%; width: 16px; height: 72px; transform: translate(-50%,-100%); background: repeating-linear-gradient(0deg,#2b2e2d 0 2px,#aeb1af 2px 4px); border: 1px solid #323534; transition: top .48s cubic-bezier(.16,1,.3,1); }
+.drill-bit { z-index: 4; left: 50%; width: 30px; height: 42px; transform: translate(-50%,-18%); transition: top .48s cubic-bezier(.16,1,.3,1); filter: drop-shadow(0 5px 5px rgba(0,0,0,.32)); }
+.drill-bit::before { content: ''; position: absolute; left: 8px; top: 0; width: 14px; height: 36px; background: linear-gradient(90deg,#2d302f,#e1e3e1 45%,#454846); clip-path: polygon(15% 0,85% 0,100% 72%,50% 100%,0 72%); }
+.drill-bit i { position: absolute; bottom: 2px; width: 13px; height: 9px; background: #676b69; border-bottom: 2px solid #242726; }.drill-bit i:nth-child(1){left:0;transform:rotate(24deg)}.drill-bit i:nth-child(2){left:9px;bottom:-2px}.drill-bit i:nth-child(3){right:0;transform:rotate(-24deg)}
+.well-depth-line { position: absolute; z-index: 5; left: 8%; right: 8%; height: 1px; border-top: 1px dashed rgba(82,73,64,.32); transition: top .48s cubic-bezier(.16,1,.3,1); }
+.well-depth-badge { position: absolute; z-index: 9; left: calc(50% - 70px); transform: translate(-100%,-50%); padding: 5px 9px; border-radius: 6px; background: #591d17; color: #fff; font-family: Manrope,sans-serif; font-size: 10px; font-weight: 850; box-shadow: 0 5px 12px rgba(81,30,23,.24); transition: top .48s cubic-bezier(.16,1,.3,1); }
+.well-depth-pulse { position: absolute; z-index: 8; left: 50%; width: 17px; height: 17px; transform: translate(-50%,-50%); border: 1px solid #fff; border-radius: 50%; background: #5bc7c0; box-shadow: 0 0 0 5px rgba(74,199,190,.23), 0 0 17px #fff; transition: top .48s cubic-bezier(.16,1,.3,1); }.well-depth-pulse i { position: absolute; inset: 5px; border-radius: 50%; background: white; }
+.formation-inspector { position: absolute; z-index: 10; top: 36px; left: calc(50% + 78px); width: min(230px,32%); min-height: 112px; padding: 15px 38px 15px 16px; border: 1px solid rgba(64,111,106,.23); border-radius: 12px; background: rgba(248,253,252,.92); box-shadow: 0 13px 32px rgba(32,84,79,.14); color: #26413e; backdrop-filter: blur(10px); }
+.formation-inspector > span { color: #75918e; font-size: 7px; font-weight: 800; letter-spacing: .08em; }.formation-inspector strong { display: block; margin-top: 5px; font: 800 16px/1.1 Manrope,sans-serif; letter-spacing: -.025em; }.formation-inspector p { margin: 8px 0 0; font-size: 8px; line-height: 1.45; }.formation-inspector svg { position: absolute; top: 15px; right: 14px; color: #65aaa4; }
+.dive-event-callout { position: absolute; z-index: 10; left: calc(50% + 37px); display: grid; grid-template-columns: 1fr auto; gap: 1px 12px; min-width: 140px; padding: 8px 10px; transform: translateY(-50%); border: 1px solid rgba(114,81,32,.18); border-radius: 8px; background: rgba(255,248,220,.94); box-shadow: 0 8px 18px rgba(69,50,24,.14); }.dive-event-callout span { grid-column: 1/-1; color: #9d6b21; font-size: 6px; font-weight: 850; text-transform: uppercase; }.dive-event-callout b { max-width: 92px; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; color: #382d1e; font-size: 9px; }.dive-event-callout small { color: #71572f; font-size: 7px; }
+.well-depth-scale { position: absolute; z-index: 4; right: 12px; inset-block: 0; width: 58px; }.well-depth-scale span { position: absolute; right: 0; transform: translateY(-50%); padding: 3px 6px; border: 1px solid rgba(60,94,90,.18); border-radius: 999px; background: rgba(255,255,255,.85); color: #526d69; font-size: 7px; font-weight: 750; }
+.well-dive-controls { padding: 10px 16px 12px; border-top: 1px solid #dce7e5; background: #fff; }
+.well-dive-slider-label { display: grid; grid-template-columns: 1fr auto 1fr; align-items: baseline; color: #899a97; font-size: 6px; font-weight: 800; letter-spacing: .08em; }.well-dive-slider-label strong { color: #1e3936; font: 850 11px Manrope,sans-serif; letter-spacing: -.02em; }.well-dive-slider-label span:last-child { text-align: right; }
+.well-dive-controls > input { width: 100%; margin: 7px 0 4px; accent-color: #9ca4a3; cursor: ew-resize; }
+.well-dive-control-meta { display: flex; justify-content: space-between; gap: 12px; color: #6b817e; font-size: 7px; font-weight: 700; }.well-dive-control-meta small { color: #9ba8a6; }
+.well-dive-mobile-events { display: none; }
+.well-dive.compact .well-dive-scene { min-height: 270px; }.well-dive.compact .formation-inspector { display: none; }.well-dive.compact .well-dive-casing { width: 76px; }.well-dive.compact .well-dive-band > span { left: 7%; }
+.dive-view { grid-template-columns: minmax(0, 1.72fr) minmax(280px,.72fr); gap: 12px; align-items: stretch; }.dive-panel,.dive-copy { min-height: 650px; }.dive-panel { overflow: hidden; display: flex; flex-direction: column; }.dive-panel .well-dive { flex: 1; }.dive-panel .well-dive-scene { min-height: 485px; }
+@media (max-width: 1050px) { .formation-inspector { width: 210px; left: calc(50% + 65px); }.well-dive-band > span { left: 5%; }.dive-view { grid-template-columns: minmax(0,1.35fr) minmax(250px,.65fr); } }
+@media (max-width: 760px) { .dive-view { display: flex; flex-direction: column; }.dive-panel,.dive-copy { min-height: 0; }.dive-panel .well-dive-scene { min-height: 480px; }.well-dive-casing { width: 72px; }.formation-inspector { left: 14px; top: 16px; width: min(220px,65%); min-height: 0; }.well-dive-band > span { left: 14px; }.well-dive-band > span b { max-width: 105px; }.dive-event-callout { left: calc(50% + 25px); min-width: 118px; }.well-depth-badge { left: calc(50% - 48px); }.well-depth-scale { right: 5px; }.well-dive-control-meta { align-items: flex-start; }.well-dive-control-meta small { max-width: 58%; text-align: right; }.well-dive-mobile-events { display: grid; gap: 1px; background: #e7eceb; border-top: 1px solid #e0e7e5; }.well-dive-mobile-events button { display: grid; grid-template-columns: 1fr auto 16px; align-items: center; gap: 8px; min-height: 42px; padding: 0 13px; border: 0; background: #fff; color: #314a47; text-align: left; }.well-dive-mobile-events small { color: #8a9a97; } }
+@media (prefers-reduced-motion: reduce) { .well-dive-strata,.drill-collar,.drill-bit,.well-depth-line,.well-depth-badge,.well-depth-pulse { transition: none; } }

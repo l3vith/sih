@@ -8,7 +8,13 @@
     "build": "tsc -b && vite build",
     "preview": "vite preview",
     "ocr-server": "node server.mjs",
-    "dev:all": "concurrently --kill-others --names web,api \"vite\" \"node server.mjs\""
+    "dev:all": "node scripts/ocr-runtime.mjs start && concurrently --kill-others --names web,api \"vite\" \"node server.mjs\"",
+    "ocr:start": "node scripts/ocr-runtime.mjs start",
+    "ocr:stop": "node scripts/ocr-runtime.mjs stop",
+    "ocr:logs": "node scripts/ocr-runtime.mjs logs",
+    "test:ocr": "node --test server/mlx-ocr.test.mjs",
+    "ocr:setup": "node scripts/ocr-runtime.mjs setup",
+    "ocr:status": "node scripts/ocr-runtime.mjs status"
   },
   "dependencies": {
     "@google/genai": "^2.21.0",
@@ -25,7 +31,7 @@
     "pdfjs-dist": "^6.3.289",
     "react": "latest",
     "react-dom": "latest",
-    "tesseract.js": "^7.0.0",
+    "sharp": "^0.34.5",
     "typescript": "latest",
     "vite": "latest"
   },

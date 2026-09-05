@@ -1,5 +1,6 @@
 import 'dotenv/config'
 import cors from 'cors'
+import { installMlxOcr } from './server/mlx-ocr.mjs'
 import express from 'express'
 import { Groq } from 'groq-sdk'
 import { pipeline } from '@huggingface/transformers'
@@ -14,7 +15,7 @@ else console.log('[supabase] not configured — running in local-only mode')
 
 const app = express()
 app.use(cors())
-app.use(express.json({ limit: '8mb' }))
+app.use(express.json({ limit: '32mb' }))
 
 const model = 'openai/gpt-oss-120b'
 const embeddingModel = 'Xenova/all-MiniLM-L6-v2'
@@ -36,25 +37,6 @@ async function googleChat({ messages, temperature = 0.05, max_tokens = 1200 }) {
   const out = typeof text === 'string' ? text : String(text || '')
   if (!out.trim()) throw new Error('Google AI returned empty')
   return out
-}
-async function googleVisionOCR(imageBase64, mimeType = 'image/png') {
-  if (!googleAI) throw new Error('Google AI not configured')
-  const cleanB64 = String(imageBase64).replace(/^data:[^,]+,/, '')
-  const response = await googleAI.models.generateContent({
-    model: googleModel,
-    contents: [
-      {
-        role: 'user',
-        parts: [
-          { text: 'You are a drilling report OCR. Extract ALL text from this image. Preserve line breaks and table layout. Return only the transcribed text, no explanation.' },
-          { inlineData: { mimeType, data: cleanB64 } },
-        ],
-      },
-    ],
-    config: { temperature: 0.1, maxOutputTokens: 4000 },
-  })
-  const text = typeof response.text === 'function' ? response.text() : response.text
-  return typeof text === 'string' ? text : String(text || '')
 }
 // Osaurus local LLM fallback for LLM-only queries (http://127.0.0.1:1337)
 const osaurusUrl = process.env.OSAURUS_URL || 'http://127.0.0.1:1337'
@@ -227,29 +209,10 @@ function locateSegments(sections, words) {
       const score = candidate.includes(anchor) || anchor.includes(candidate) ? 2 + coverage : coverage
       return { word, score }
     }).filter(({ score }) => score >= threshold).sort((a, b) => b.score - a.score)[0]?.word
-    if (match) hits.push({ page: Number(match.page), x: 3.5, y: Math.max(0, Number(match.y) - .8), w: 93, h: 10, label: String(section.label || 'Section').toUpperCase(), tone: index % 2 ? 'amber' : 'cyan' })
+    if (match) hits.push({ page: Number(match.page), x: Number(match.x), y: Number(match.y), w: Number(match.w), h: Number(match.h), label: String(section.label || 'Section').toUpperCase(), tone: index % 2 ? 'amber' : 'cyan' })
   }
-  // Fallback: if no heading/word matches (common for handwritten scans where OCR text diverges from anchor), distribute sections evenly so viewer always shows borders
-  if (hits.length === 0 && sections.length > 0) {
-    const byPage = new Map()
-    // Group sections by page if we have any hit hints, else assume all on page 1 for single-page scans
-    const pageForFallback = words.length ? Math.min(...words.map((w) => Number(w.page) || 1)) : 1
-    for (const s of sections) {
-      const p = pageForFallback
-      if (!byPage.has(p)) byPage.set(p, [])
-      byPage.get(p).push(s)
-    }
-    for (const [page, secs] of byPage.entries()) {
-      secs.forEach((sec, idx) => {
-        const y = 8 + (idx / Math.max(1, secs.length)) * 78
-        hits.push({ page, x: 3.5, y, w: 93, h: Math.max(7, 78 / secs.length - 1.5), label: String(sec.label || 'Section').toUpperCase(), tone: idx % 2 ? 'amber' : 'cyan' })
-      })
-    }
-  }
-  return hits.map((hit) => {
-    const next = hits.filter((candidate) => candidate.page === hit.page && candidate.y > hit.y).sort((a, b) => a.y - b.y)[0]
-    return { ...hit, h: Math.max(7, Math.min(38, next ? next.y - hit.y - 1.25 : 18)) }
-  })
+  return hits
+
 }
 
 function semanticProjection(vectors) {
@@ -353,18 +316,7 @@ app.get('/api/supabase/documents', async (_req, res) => {
   res.json({ data })
 })
 
-// Vision OCR via Google Gemma (first try for images, has vision)
-app.post('/api/vision-ocr', async (req, res) => {
-  const { imageBase64, mimeType } = req.body || {}
-  const b64 = String(imageBase64 || '').replace(/^data:[^,]+,/, '')
-  if (!b64) return res.status(400).json({ error: 'imageBase64 required' })
-  try {
-    const text = await googleVisionOCR(b64, mimeType || 'image/png')
-    res.json({ text })
-  } catch (e) {
-    res.status(500).json({ error: e instanceof Error ? e.message : String(e) })
-  }
-})
+installMlxOcr(app)
 
 app.post('/api/structure-ddr', async (req, res) => {
   if (!groq) return res.status(503).json({ error: 'GROQ_API_KEY is not configured.' })

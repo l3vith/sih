@@ -1,3 +1,5 @@
+> Implementation update: OCR now uses GLM-OCR (0.9B, bf16) through MLX on Apple Silicon/Metal. The earlier dots.ocr CUDA runtime and PaddleOCR proposals are superseded. The recognition path returns text with page markers; localized bounding boxes are not available. See README.md for native setup and verification.
+
 # PLAN.md — Nearby Wells Intelligence System (NWIS)
 
 ## 1. Summary and fixed decisions

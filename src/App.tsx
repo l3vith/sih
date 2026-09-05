@@ -6,13 +6,11 @@ import type { FeatureCollection, Point } from 'geojson'
 import 'maplibre-gl/dist/maplibre-gl.css'
 import { getDocument, GlobalWorkerOptions } from 'pdfjs-dist'
 import pdfWorkerUrl from 'pdfjs-dist/build/pdf.worker.min.mjs?url'
-import { createWorker } from 'tesseract.js'
-import { pipeline as hfPipeline } from '@huggingface/transformers'
 
 // Vite serves workers as ESM – wire maplibre's worker to avoid
 // "blocked because of a disallowed MIME type" in dev (localhost:5173)
 setWorkerUrl(maplibreWorkerUrl)
-import { Activity, AlertTriangle, Anchor, ArrowUpRight, Bell, BrainCircuit, ChevronDown, CircleHelp, Crosshair, Database, FileScan, FileText, Flame, Gauge, MapPinned, Maximize2, Menu, Network, PanelLeftClose, Pause, Play, RotateCcw, Search, Send, Settings2, Sparkles, Upload, Waves, X, Zap } from 'lucide-react'
+import { Activity, AlertTriangle, Anchor, ArrowUpRight, Bell, BrainCircuit, ChevronDown, CircleHelp, Crosshair, Database, FileScan, FileText, Flame, Gauge, MapPinned, LoaderCircle, Maximize2, Menu, Network, PanelLeftClose, Pause, Play, RotateCcw, Search, Send, Settings2, Sparkles, Upload, Waves, X, Zap } from 'lucide-react'
 import WellDive from './components/WellDive'
 import { isSupabaseConfigured, loadDocumentsFromSupabase, saveAlert as saveAlertToSupabase, saveDocumentToSupabase, saveTelemetryBatch, supabase, upsertWellFromReport } from './lib/supabase'
 
@@ -256,153 +254,16 @@ function evaluateTelemetryAlerts(sampleWindow: TelemetrySample[], allSamples: Te
   return alerts
 }
 
-// --- Combined OCR: Tesseract (fast, bbox) + TrOCR (handwriting) fallback ---
-let trocrHandPromise: Promise<any> | null = null
-let trocrPrintedPromise: Promise<any> | null = null
-async function getTrOCR(handwritten = true): Promise<any> {
-  if (handwritten) {
-    if (!trocrHandPromise) trocrHandPromise = hfPipeline('image-to-text', 'Xenova/trocr-base-handwritten' as any) as any
-    return trocrHandPromise
-  }
-  if (!trocrPrintedPromise) trocrPrintedPromise = hfPipeline('image-to-text', 'Xenova/trocr-base-printed' as any) as any
-  return trocrPrintedPromise
-}
-
-type CombinedOCRResult = { text: string; words: Array<{ text: string; bbox: { x0: number; y0: number; x1: number; y1: number }; confidence?: number }>; engine: string; confidence: number }
-
-async function tryGoogleVisionOCR(canvas: HTMLCanvasElement): Promise<string | null> {
-  try {
-    const dataUrl = canvas.toDataURL('image/png')
-    const b64 = dataUrl.split(',')[1]
-    if (!b64) return null
-    const res = await fetch('/api/vision-ocr', {
-      method: 'POST',
-      headers: { 'content-type': 'application/json' },
-      body: JSON.stringify({ imageBase64: b64, mimeType: 'image/png' }),
-      signal: AbortSignal.timeout(15000) as any,
-    } as any)
-    if (!res.ok) return null
-    const j: any = await res.json()
-    const t = String(j.text || '').trim()
-    return t.length > 10 ? t : null
-  } catch {
-    return null
-  }
-}
-
-async function recognizeCombined(canvas: HTMLCanvasElement, pageLabel: string, onProgress?: (p: number, m: string) => void): Promise<CombinedOCRResult> {
-  // Try Google Vision first (gemma-4-26b-a4b-it has vision) in parallel with Tesseract for bbox
-  const worker: any = await (createWorker as any)('eng', 1)
-  const tPromise = worker.recognize(canvas) as Promise<any>
-  const gPromise = tryGoogleVisionOCR(canvas)
-
-  const tResult: any = await tPromise
-  const tData = tResult.data as { text: string; confidence: number; words?: Array<{ text: string; bbox: { x0: number; y0: number; x1: number; y1: number }; confidence: number }> }
-  const tText = String(tData.text || '').trim()
-  const tWords = (tData.words || []) as Array<{ text: string; bbox: { x0: number; y0: number; x1: number; y1: number }; confidence: number }>
-  const tConf = typeof tData.confidence === 'number' ? tData.confidence : (tWords.length ? tWords.reduce((s, w) => s + (w.confidence || 0), 0) / tWords.length : 0)
-
-  // Await Google vision (with timeout already)
-  let gText: string | null = null
-  try { gText = await gPromise } catch { gText = null }
-
-  // If Google vision gave strong result, prefer it for text (handwriting), keep Tesseract words for bbox
-  if (gText && gText.length > 30) {
-    const useGoogle = gText.length > tText.length * 1.1 || tConf < 65 || tText.length < 40
-    if (useGoogle) {
-      await worker.terminate()
-      // Keep Tesseract words for segmentation if we have them, else synthesize from Google text
-      let finalWords: any[] = tWords
-      if (tWords.length < 6) {
-        const toks = gText.split(/\s+/).filter(Boolean).slice(0, 80)
-        const cols = 8
-        const rowH = canvas.height / Math.max(1, Math.ceil(toks.length / cols))
-        finalWords = toks.map((tok: string, i: number) => {
-          const col = i % cols
-          const row = Math.floor(i / cols)
-          const x0 = (col / cols) * canvas.width
-          const y0 = row * rowH
-          const x1 = x0 + Math.max(40, tok.length * 8)
-          const y1 = y0 + rowH * 0.6
-          return { text: tok, bbox: { x0, y0, x1: Math.min(x1, canvas.width), y1: Math.min(y1, canvas.height) }, confidence: 78 }
-        })
-      }
-      return { text: gText, words: finalWords, engine: 'google-vision', confidence: Math.max(tConf, 80) }
-    }
-    // Otherwise merge Google text as supplement if it adds new content
-    if (gText.length > 40) {
-      const tSet = new Set(tText.toLowerCase().split(/\s+/))
-      const extra = gText.split(/\s+/).filter((w: string) => !tSet.has(w.toLowerCase())).join(' ').trim()
-      if (extra.length > 20) {
-        await worker.terminate()
-        return { text: tText + ' ' + gText, words: tWords, engine: 'combined-google', confidence: Math.max(tConf, 75) }
-      }
-    }
-  }
-
-  if (tText.length > 60 && tConf > 68 && tWords.length > 8) {
-    await worker.terminate()
-    return { text: tText, words: tWords, engine: 'tesseract', confidence: tConf }
-  }
-
-  if (onProgress) onProgress(0, `TrOCR fallback for ${pageLabel} (Tesseract ${tConf.toFixed(0)}%, ${tWords.length}w)`)
-  try {
-    let trocr: any
-    try { trocr = await getTrOCR(true) } catch { trocr = await getTrOCR(false) }
-    const trocrOut: any = await trocr(canvas)
-    let trocrText = ''
-    if (Array.isArray(trocrOut) && trocrOut[0]?.generated_text) trocrText = String(trocrOut[0].generated_text).trim()
-    else if (typeof trocrOut === 'string') trocrText = trocrOut.trim()
-    else if (trocrOut?.generated_text) trocrText = String(trocrOut.generated_text).trim()
-    else trocrText = String(trocrOut || '').trim()
-
-    let finalText = tText
-    let finalWords: any[] = tWords
-    let engine = 'tesseract'
-    let finalConf = tConf
-
-    if (trocrText && trocrText.length > 20) {
-      const useTrOCR = tConf < 62 || trocrText.length > tText.length * 1.15 || (tText.length < 30 && trocrText.length > 30)
-      if (useTrOCR) {
-        finalText = trocrText
-        // If we already have Google text, combine all three
-        if (gText && gText.length > 30 && !finalText.includes(gText.slice(0, 20))) finalText = gText + ' ' + trocrText
-        else if (gText && gText.length > 30) finalText = gText
-        engine = tConf < 50 ? 'trocr' : 'combined'
-        finalConf = Math.max(tConf, 72)
-        if (tWords.length < 6) {
-          const toks = finalText.split(/\s+/).filter(Boolean).slice(0, 80)
-          const cols = 8
-          const rowH = canvas.height / Math.max(1, Math.ceil(toks.length / cols))
-          finalWords = toks.map((tok: string, i: number) => {
-            const col = i % cols
-            const row = Math.floor(i / cols)
-            const x0 = (col / cols) * canvas.width
-            const y0 = row * rowH
-            const x1 = x0 + Math.max(40, tok.length * 8)
-            const y1 = y0 + rowH * 0.6
-            return { text: tok, bbox: { x0, y0, x1: Math.min(x1, canvas.width), y1: Math.min(y1, canvas.height) }, confidence: 75 }
-          })
-        }
-      } else if (trocrText.length > 40) {
-        const tSet = new Set(tText.toLowerCase().split(/\s+/))
-        const extra = trocrText.split(/\s+/).filter((w: string) => !tSet.has(w.toLowerCase())).join(' ').trim()
-        if (extra.length > 20) { finalText = tText + ' ' + trocrText; if (gText) finalText += ' ' + gText; engine = 'combined' }
-      }
-    } else if (gText && gText.length > 30) {
-      finalText = gText
-      engine = 'google-vision'
-      finalConf = 80
-    }
-    await worker.terminate()
-    return { text: finalText, words: finalWords, engine, confidence: finalConf }
-  } catch (e) {
-    console.warn('[OCR] TrOCR fallback failed, using Tesseract', e)
-    await worker.terminate()
-    // If Google gave text, use it as last resort
-    if (gText && gText.length > 30) return { text: gText, words: tWords.length ? tWords : [], engine: 'google-vision', confidence: 80 }
-    return { text: tText, words: tWords, engine: 'tesseract', confidence: tConf }
-  }
+type OCRResult = { text: string; words: Array<{ text: string; bbox: { x0: number; y0: number; x1: number; y1: number } }>; width: number; height: number; engine: string }
+async function recognizePage(canvas: HTMLCanvasElement): Promise<OCRResult> {
+  const response = await fetch('/api/ocr', {
+    method: 'POST', headers: { 'content-type': 'application/json' },
+    body: JSON.stringify({ imageBase64: canvas.toDataURL('image/png') }),
+    signal: AbortSignal.timeout(660000),
+  })
+  const payload = await response.json().catch(() => ({ error: 'OCR service returned an invalid response. Check that the API server is running.' }))
+  if (!response.ok) throw new Error(payload.error || 'Local GLM-OCR processing failed.')
+  return payload as OCRResult
 }
 
 function semanticProjection(vectors: number[][]): { x: number; y: number }[] {
@@ -443,7 +304,7 @@ function cosine(a: number[], b: number[]) {
 }
 
 async function analyseImage(file: File, onProgress: (progress: number, message: string) => void): Promise<{ analysis: Analysis; pages: number }> {
-  onProgress(25, 'Running OCR on image document (Tesseract + TrOCR)')
+  onProgress(25, 'Reading page 1 with local GLM-OCR')
   const imageUrl = URL.createObjectURL(file)
   try {
     const img = await new Promise<HTMLImageElement>((resolve, reject) => {
@@ -458,15 +319,15 @@ async function analyseImage(file: File, onProgress: (progress: number, message: 
     const context = canvas.getContext('2d')
     if (!context) throw new Error('Canvas not available for image OCR.')
     context.drawImage(img, 0, 0)
-    const combined = await recognizeCombined(canvas, 'page 1', onProgress)
+    const combined = await recognizePage(canvas)
     const text = `\n\n[PAGE 1]\n${String(combined.text || '').trim()}`
-    const words: WordBox[] = (combined.words || []).map((word) => ({ text: word.text, page: 1, x: word.bbox.x0 / canvas.width * 100, y: word.bbox.y0 / canvas.height * 100, w: (word.bbox.x1 - word.bbox.x0) / canvas.width * 100, h: (word.bbox.y1 - word.bbox.y0) / canvas.height * 100, fromOcr: true }))
+    const words: WordBox[] = (combined.words || []).map((word) => ({ text: word.text, page: 1, x: word.bbox.x0 / combined.width * 100, y: word.bbox.y0 / combined.height * 100, w: (word.bbox.x1 - word.bbox.x0) / combined.width * 100, h: (word.bbox.y1 - word.bbox.y0) / combined.height * 100, fromOcr: true }))
     if (!text.replace(/\[PAGE \d+\]/g, '').trim()) throw new Error('No readable text was found in this image.')
-    onProgress(72, `Sending OCR evidence to Groq for factual structuring (${combined.engine} ${combined.confidence.toFixed(0)}%)`)
+    onProgress(72, `Sending OCR evidence to Groq for factual structuring (${combined.engine})`)
     const response = await fetch('/api/structure-ddr', { method: 'POST', headers: { 'content-type': 'application/json' }, body: JSON.stringify({ text, words, name: file.name }) })
     const payload = await response.json()
     if (!response.ok) throw new Error(payload.error || 'Document analysis failed.')
-    onProgress(100, `Indexed ${payload.report.sections?.length || 0} sections from 1 page via ${combined.engine}`)
+    onProgress(95, `Indexed ${payload.report.sections?.length || 0} sections from 1 page via ${combined.engine}`)
     return { analysis: payload as Analysis, pages: 1 }
   } finally {
     URL.revokeObjectURL(imageUrl)
@@ -474,32 +335,25 @@ async function analyseImage(file: File, onProgress: (progress: number, message: 
 }
 
 async function analysePdf(file: File, onProgress: (progress: number, message: string) => void) {
-  const pdf = await getDocument({ data: await file.arrayBuffer() }).promise
+  const loadingTask = getDocument({ data: await file.arrayBuffer() })
+  const pdf = await loadingTask.promise
+  try {
   let text = ''
   const words: WordBox[] = []
   for (let pageNumber = 1; pageNumber <= pdf.numPages; pageNumber += 1) {
     const page = await pdf.getPage(pageNumber)
-    const viewport = page.getViewport({ scale: 1 })
-    const content = await page.getTextContent()
-    let pageText = ''
-    for (const item of content.items) {
-      if (!('str' in item) || !item.str.trim()) continue
-      const [,,, height, x, y] = item.transform
-      pageText += ` ${item.str}`
-      words.push({ text: item.str, page: pageNumber, x: x / viewport.width * 100, y: (viewport.height - y - Math.abs(height)) / viewport.height * 100, w: item.width / viewport.width * 100, h: Math.max(1, Math.abs(height) / viewport.height * 100) })
-    }
-    if (pageText.trim().length < 80) {
-      onProgress(Math.round(pageNumber / pdf.numPages * 50), `Running Tesseract+TrOCR on scanned page ${pageNumber} of ${pdf.numPages}`)
-      const ocrViewport = page.getViewport({ scale: 1.8 })
-      const canvas = window.document.createElement('canvas'); canvas.width = ocrViewport.width; canvas.height = ocrViewport.height
-      const context = canvas.getContext('2d')
-      if (context) {
-        await page.render({ canvas, canvasContext: context, viewport: ocrViewport }).promise
-        const combined = await recognizeCombined(canvas, `page ${pageNumber}`)
-        pageText = combined.text
-        for (const word of combined.words || []) words.push({ text: word.text, page: pageNumber, x: word.bbox.x0 / canvas.width * 100, y: word.bbox.y0 / canvas.height * 100, w: (word.bbox.x1 - word.bbox.x0) / canvas.width * 100, h: (word.bbox.y1 - word.bbox.y0) / canvas.height * 100, fromOcr: true })
-      }
-    }
+    onProgress(Math.round((pageNumber - 1) / pdf.numPages * 65) + 5, `Reading page ${pageNumber} of ${pdf.numPages} with local GLM-OCR`)
+    const viewport = page.getViewport({ scale: 1.8 })
+    const canvas = window.document.createElement('canvas')
+    canvas.width = viewport.width; canvas.height = viewport.height
+    const context = canvas.getContext('2d')
+    if (!context) throw new Error('Canvas not available for document OCR.')
+    await page.render({ canvas, canvasContext: context, viewport }).promise
+    const combined = await recognizePage(canvas)
+    const pageText = combined.text
+    for (const word of combined.words) words.push({ text: word.text, page: pageNumber, x: word.bbox.x0 / combined.width * 100, y: word.bbox.y0 / combined.height * 100, w: (word.bbox.x1 - word.bbox.x0) / combined.width * 100, h: (word.bbox.y1 - word.bbox.y0) / combined.height * 100, fromOcr: true })
+    canvas.width = 0; canvas.height = 0
+    page.cleanup()
     text += `\n\n[PAGE ${pageNumber}]\n${pageText.trim()}`
     onProgress(Math.round(pageNumber / pdf.numPages * 65), `Extracted page ${pageNumber} of ${pdf.numPages}`)
   }
@@ -508,12 +362,15 @@ async function analysePdf(file: File, onProgress: (progress: number, message: st
   const response = await fetch('/api/structure-ddr', { method: 'POST', headers: { 'content-type': 'application/json' }, body: JSON.stringify({ text, words, name: file.name }) })
   const payload = await response.json()
   if (!response.ok) throw new Error(payload.error || 'Document analysis failed.')
-  onProgress(100, `Indexed ${payload.report.sections?.length || 0} sections from ${pdf.numPages} pages`)
+  onProgress(95, `Indexed ${payload.report.sections?.length || 0} sections from ${pdf.numPages} pages`)
   return { analysis: payload as Analysis, pages: pdf.numPages }
+  } finally { await loadingTask.destroy() }
 }
 
 async function analyseDocument(file: File, onProgress: (progress: number, message: string) => void) {
+  if (/\.tiff?$/i.test(file.name)) throw new Error('Convert TIFF files to PDF or PNG before uploading.')
   if (isImageFile(file)) return analyseImage(file, onProgress)
+  if (!/\.pdf$/i.test(file.name) && file.type !== 'application/pdf') throw new Error('Select a PDF, PNG, JPEG, WebP or BMP file.')
   return analysePdf(file, onProgress)
 }
 
@@ -686,7 +543,7 @@ function PdfViewer({ document }: { document: IndexedDocument }) {
 function PanelHeader({ icon, title, meta }: { icon: ReactNode; title: string; meta?: string }) { return <div className="panel-header"><span className="panel-title"><i>{icon}</i>{title}</span>{meta && <span className="panel-meta">{meta}</span>}</div> }
 function EmptyWorkspace({ view }: { view: View }) { const copy = view === 'documents' ? 'Upload a DDR, WCR, scan, or mud log to start OCR and factual extraction.' : view === 'embeddings' ? 'Upload and index documents before exploring their text-vector relationships.' : view === 'prediction' ? 'Upload an indexed report before asking evidence-grounded questions.' : 'Upload a drilling document to populate the map, well data, events, risks, and correlations.'; return <section className="empty-workspace"><FileScan size={30} /><h2>No operational data loaded</h2><p>{copy}</p><span>Use <b>Ingest document</b> in the sidebar to begin.</span></section> }
 
-function DocumentPanel({ document, processing, progress, status }: { document: IndexedDocument; processing: boolean; progress: number; status: string }) { return <><PanelHeader icon={<FileScan size={16} />} title="DOCUMENT INTELLIGENCE" meta={processing ? `${progress}%` : 'INDEXED'} /><div className="document-stage"><div className="paper"><PdfViewer document={document} /></div></div><div className="document-footer"><span><i className="live-dot" /> {status}</span><span>{document.segments.length} REGIONS · {document.pages} PAGES</span></div></> }
+function DocumentPanel({ document, processing, progress, status }: { document: IndexedDocument; processing: boolean; progress: number; status: string }) { return <><PanelHeader icon={<FileScan size={16} />} title="DOCUMENT INTELLIGENCE" meta={processing ? `${progress}%` : 'INDEXED'} /><div className="document-stage"><div className="paper"><PdfViewer document={document} /></div></div><div className="document-footer"><span><i className="live-dot" /> {status}</span><span>{document.segments.length ? `${document.segments.length} REGIONS · ` : 'TEXT OCR · '}{document.pages} PAGES</span></div></> }
 
 function DepthPanel({ report, onOpenDive }: { report: Report; onOpenDive?: () => void }) {
   const formations = report.formations?.length ? report.formations : report.formation ? [{ name: report.formation, top_md: null, bottom_md: null }] : []
@@ -1011,7 +868,8 @@ export default function App() {
   }, [])
   async function ingestFile(file: File) {
     // allow re-ingesting same name: replace existing entry
-    setProcessing(true); setProgress(1); setError(''); setStatus(`Opening ${file.name}`); setView('documents')
+    setProcessing(true); setProgress(1); setStatus(`Opening ${file.name}`); setView('documents')
+    if (window.matchMedia('(max-width: 760px)').matches) setSidebarOpen(false)
     try {
       const { analysis, pages } = await analyseDocument(file, (nextProgress, nextStatus) => { setProgress(nextProgress); setStatus(nextStatus) })
       const url = URL.createObjectURL(file)
@@ -1043,20 +901,28 @@ export default function App() {
           }).catch(() => {})
         }
       }
-    } catch (uploadError) { setError(uploadError instanceof Error ? uploadError.message : 'Document processing failed.'); setStatus('Document processing failed') } finally { setProcessing(false) }
+    } catch (uploadError) { setError(previous => [previous, `${file.name}: ${uploadError instanceof Error ? uploadError.message : 'Document processing failed.'}`].filter(Boolean).join(' • ')); setStatus('Document processing failed') } finally { setProgress(100) }
   }
   async function handleUpload(event: ChangeEvent<HTMLInputElement>) { const files = event.target.files; if (!files || !files.length) return; await ingestFiles(files); event.target.value = '' }
   // multi-file drag support
+  const ingestingRef = useRef(false)
+  const [processingFile, setProcessingFile] = useState('')
   async function ingestFiles(files: FileList | File[]) {
-    for (const f of Array.from(files)) { // sequential to avoid Groq rate
-      // eslint-disable-next-line no-await-in-loop
-      await ingestFile(f)
-    }
+    if (ingestingRef.current) return
+    ingestingRef.current = true
+    setProcessing(true)
+    setError('')
+    try {
+      for (const f of Array.from(files)) {
+        setProcessingFile(f.name)
+        await ingestFile(f)
+      }
+    } finally { ingestingRef.current = false; setProcessing(false) }
   }
   const report = document?.report
   const navItems: [View, ReactNode, string][] = [['command', <Crosshair size={17} />, 'Command Center'], ['dive', <Waves size={17} />, 'Well Dive'], ['documents', <FileScan size={17} />, 'Documents'], ['embeddings', <Network size={17} />, 'Embedding Explorer'], ['prediction', <BrainCircuit size={17} />, 'Prediction Mode']]
   function renderView() {
-    if (documents.length === 0) return <EmptyWorkspace view={view} />
+    if (documents.length === 0) return processing ? null : <EmptyWorkspace view={view} />
     if (!document || !report) return <EmptyWorkspace view={view} />
     if (view === 'documents') return <div className="view-grid documents-view"><div className="panel document-panel"><DocumentPanel document={document} processing={processing} progress={progress} status={status} /></div><div className="panel activity-panel"><StreamPanel document={document} status={status} /></div></div>
     if (view === 'embeddings') {
@@ -1085,5 +951,5 @@ export default function App() {
           ))}
           <div className="search-hint">Hybrid: keyword score + formation/severity filter · Vector rank via token overlap + embedding cosine (explorer)</div>
         </div>
-              )}</div><div className="top-actions"><span className="online-pill"><i /> {processing ? `PROCESSING ${progress}%` : documents.length ? `${documents.length} SITE(S) INDEXED` : 'AWAITING DOCUMENT'}</span><span className="online-pill" style={isSupabaseConfigured ? { color: '#2a9d8f', border: '1px solid #cde5e1' } : { color: '#b0b1ae', border: '1px solid #ecece8' }}><i style={{ background: isSupabaseConfigured ? '#2a9d8f' : '#b0b1ae' }} /> {isSupabaseConfigured ? 'SUPABASE' : 'LOCAL'}</span><button aria-label="Notifications"><Bell size={17} /></button><button aria-label="Settings"><Settings2 size={17} /></button></div></header><div className="app-layout"><aside className="sidebar"><div className="sidebar-top"><span>WORKSPACE</span><button onClick={() => setSidebarOpen(false)} aria-label="Collapse sidebar"><PanelLeftClose size={15} /></button></div><nav>{navItems.map(([id, icon, label]) => <button key={id} className={view === id ? 'active' : ''} onClick={() => setView(id)}>{icon}<span>{label}</span></button>)}</nav><div className="sidebar-section"><span>ACTIVE WELL</span><button className="well-switch" onClick={() => setView('embeddings')}><strong>{report?.well_name || 'No well indexed'}</strong><small>{report ? `${report.formation || 'Formation not found'} · ${value(report.current_md, ' m')} · ${documents.length} site(s)` : 'Upload drilling documents'} </small><ChevronDown size={14} /></button>{documents.length > 1 && <div style={{ display: 'grid', gap: 4, marginTop: 6, maxHeight: 132, overflowY: 'auto' }}>{documents.map((doc) => <button key={doc.name} onClick={() => setActiveName(doc.name)} style={{ textAlign: 'left', padding: '6px 8px', borderRadius: 7, border: activeName===doc.name || (!activeName && doc.name===document?.name) ? '1px solid #f0c1b4' : '1px solid var(--line)', background: activeName===doc.name || (!activeName && doc.name===document?.name) ? 'var(--coral-soft)' : 'white', fontSize: 9 }}><strong style={{ display:'block', fontSize: 9 }}>{doc.report.well_name ?? doc.name}</strong><small style={{ color: '#8a8c89' }}>{doc.report.formation ?? '—'} · {value(doc.report.current_md, ' m')}</small></button>)}</div>}</div><div className="sidebar-section"><span>QUICK ACTIONS</span><label className="sidebar-upload" title="Select a PDF or image drilling report"><Upload size={15} /> Ingest document(s)<input type="file" multiple accept=".pdf,.png,.jpg,.jpeg,.tiff,.bmp,.webp" onChange={handleUpload} /></label><button disabled={!document} onClick={() => setView('prediction')}><Sparkles size={15} /> Ask NWIS</button></div><div className="sidebar-foot"><span><i className="online-dot" /> {processing ? status : document ? 'Index ready' : 'No dataset loaded'}</span><small>{document?.name || 'NO DOCUMENT'}</small></div></aside><main className="main-content"><div className="page-heading"><div><span className="eyebrow">{view === 'command' ? 'FIELD OVERVIEW' : view === 'documents' ? 'DOCUMENT INTELLIGENCE' : view === 'embeddings' ? 'EVIDENCE GRAPH' : 'DECISION SUPPORT'}</span><h1>{heading}</h1></div><span className="date-stamp">{report?.report_date || 'DATE NOT FOUND'}{report?.report_number ? ` / ${report.report_number}` : ''}</span></div>{error && <div className="pipeline-error"><AlertTriangle size={15} />{error}</div>}<div className="workspace">{renderView()}</div></main></div>{dragOver && <div className="drag-overlay"><Upload size={22} /><span>Drop DDRs / WCRs to ingest (multi)</span></div>}<div className="status-footer"><span><i className="online-dot" /> {processing ? status : document ? 'INDEXED FROM UPLOADED DOCUMENT' : 'AWAITING UPLOAD'}</span><span><FileText size={12} /> {document?.name || 'No document indexed'}</span><span>{document ? `${document.report.sections.length} sections · ${document.report.events.length} events · ${document.embeddings.length} vectors` : 'No operational data loaded'}</span><CircleHelp size={13} /></div></div>
+              )}</div><div className="top-actions"><span className="online-pill"><i /> {processing ? `PROCESSING ${progress}%` : documents.length ? `${documents.length} SITE(S) INDEXED` : 'AWAITING DOCUMENT'}</span><span className="online-pill" style={isSupabaseConfigured ? { color: '#2a9d8f', border: '1px solid #cde5e1' } : { color: '#b0b1ae', border: '1px solid #ecece8' }}><i style={{ background: isSupabaseConfigured ? '#2a9d8f' : '#b0b1ae' }} /> {isSupabaseConfigured ? 'SUPABASE' : 'LOCAL'}</span><button aria-label="Notifications"><Bell size={17} /></button><button aria-label="Settings"><Settings2 size={17} /></button></div></header><div className="app-layout"><aside className="sidebar"><div className="sidebar-top"><span>WORKSPACE</span><button onClick={() => setSidebarOpen(false)} aria-label="Collapse sidebar"><PanelLeftClose size={15} /></button></div><nav>{navItems.map(([id, icon, label]) => <button key={id} className={view === id ? 'active' : ''} onClick={() => setView(id)}>{icon}<span>{label}</span></button>)}</nav><div className="sidebar-section"><span>ACTIVE WELL</span><button className="well-switch" onClick={() => setView('embeddings')}><strong>{report?.well_name || 'No well indexed'}</strong><small>{report ? `${report.formation || 'Formation not found'} · ${value(report.current_md, ' m')} · ${documents.length} site(s)` : 'Upload drilling documents'} </small><ChevronDown size={14} /></button>{documents.length > 1 && <div style={{ display: 'grid', gap: 4, marginTop: 6, maxHeight: 132, overflowY: 'auto' }}>{documents.map((doc) => <button key={doc.name} onClick={() => setActiveName(doc.name)} style={{ textAlign: 'left', padding: '6px 8px', borderRadius: 7, border: activeName===doc.name || (!activeName && doc.name===document?.name) ? '1px solid #f0c1b4' : '1px solid var(--line)', background: activeName===doc.name || (!activeName && doc.name===document?.name) ? 'var(--coral-soft)' : 'white', fontSize: 9 }}><strong style={{ display:'block', fontSize: 9 }}>{doc.report.well_name ?? doc.name}</strong><small style={{ color: '#8a8c89' }}>{doc.report.formation ?? '—'} · {value(doc.report.current_md, ' m')}</small></button>)}</div>}</div><div className="sidebar-section"><span>QUICK ACTIONS</span><label className="sidebar-upload" title="Select a PDF or image drilling report"><Upload size={15} /> Ingest document(s)<input type="file" disabled={processing} multiple accept=".pdf,.png,.jpg,.jpeg,.bmp,.webp" onChange={handleUpload} /></label><button disabled={!document} onClick={() => setView('prediction')}><Sparkles size={15} /> Ask NWIS</button></div><div className="sidebar-foot"><span><i className="online-dot" /> {processing ? status : document ? 'Index ready' : 'No dataset loaded'}</span><small>{document?.name || 'NO DOCUMENT'}</small></div></aside><main className="main-content"><div className="page-heading"><div><span className="eyebrow">{view === 'command' ? 'FIELD OVERVIEW' : view === 'documents' ? 'DOCUMENT INTELLIGENCE' : view === 'embeddings' ? 'EVIDENCE GRAPH' : 'DECISION SUPPORT'}</span><h1>{heading}</h1></div><span className="date-stamp">{report?.report_date || 'DATE NOT FOUND'}{report?.report_number ? ` / ${report.report_number}` : ''}</span></div>{error && <div className="pipeline-error"><AlertTriangle size={15} />{error}</div>}{processing && <section className="processing-loader" role="status" aria-live="polite"><LoaderCircle className="ocr-spinner" size={24} /><div><strong>Processing document</strong><span>{processingFile}</span><p>{status}</p><progress max={100} value={progress} aria-label="Document processing stages" /><small>Progress follows completed stages. OCR may take several minutes per page.</small></div></section>}<div className="workspace" aria-busy={processing}>{renderView()}</div></main></div>{dragOver && <div className="drag-overlay"><Upload size={22} /><span>Drop DDRs / WCRs to ingest (multi)</span></div>}<div className="status-footer"><span><i className="online-dot" /> {processing ? status : document ? 'INDEXED FROM UPLOADED DOCUMENT' : 'AWAITING UPLOAD'}</span><span><FileText size={12} /> {document?.name || 'No document indexed'}</span><span>{document ? `${document.report.sections.length} sections · ${document.report.events.length} events · ${document.embeddings.length} vectors` : 'No operational data loaded'}</span><CircleHelp size={13} /></div></div>
 }
