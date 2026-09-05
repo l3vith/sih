@@ -539,7 +539,7 @@ function circlePolygon(center: [number, number], radiusKm: number, points = 64):
   return { type: 'Feature', geometry: { type: 'Polygon', coordinates: [coords] }, properties: {} } as unknown as FeatureCollection<Point>
 }
 
-function FieldMap({ report, fullscreen }: { report: Report; fullscreen?: boolean }) {
+function FieldMap({ report, fullscreen, onToggleFullscreen }: { report: Report; fullscreen?: boolean; onToggleFullscreen?: () => void }) {
   const containerRef = useRef<HTMLDivElement>(null)
   const mapRef = useRef<MapLibreMap | null>(null)
   const [radiusKm, setRadiusKm] = useState(25)
@@ -656,26 +656,19 @@ function FieldMap({ report, fullscreen }: { report: Report; fullscreen?: boolean
   }, [wellFeatures, radiusFeature, center])
 
   if (!hasCoords || !center) return <div className="map-missing"><MapPinned size={26} /><b>No document coordinates found</b><span>The map will populate only when latitude and longitude are present in the uploaded document.</span></div>
+  const isFiltered = filteredOffsets.length !== validOffsets.length
   return <div className={`real-map-wrap ${fullscreen ? 'fullscreen' : ''}`}>
     <div ref={containerRef} className="real-map" style={{ width: '100%', height: '100%' }} />
     <div className="map-overlay-title">DOCUMENT LOCATIONS <span>• {1 + filteredOffsets.length} / {1 + validOffsets.length} WELLS</span></div>
-    <div className="map-filter-bar">
-      <label className="map-filter-group">
-        <span>RADIUS</span>
-        <input type="range" min={5} max={50} step={5} value={radiusKm} onChange={(e) => setRadiusKm(Number(e.target.value))} />
-        <strong>{radiusKm} km</strong>
-      </label>
-      <label className="map-filter-group">
-        <span>FORMATION</span>
-        <select value={formationFilter} onChange={(e) => setFormationFilter(e.target.value)}>
-          <option value="all">All formations</option>
-          {formationOptions.map(n => <option key={n} value={n}>{n}</option>)}
-        </select>
-      </label>
-      {filteredOffsets.length !== validOffsets.length && <button className="map-filter-reset" onClick={() => { setRadiusKm(25); setFormationFilter('all') }}>Reset</button>}
-    </div>
-    <div className="map-filter-count">{filteredOffsets.length === 0 ? 'No offset wells in range' : `${filteredOffsets.length} offset well(s) within ${radiusKm} km${formationFilter !== 'all' ? ` · ${formationFilter}` : ''}`}</div>
-    <aside className="map-ddr-preview"><b><FileText size={12} /> INDEXED LOCATION</b><span>{report.well_name || 'Well name not found'}</span><small>{report.latitude!.toFixed(6)}, {report.longitude!.toFixed(6)}</small><strong>{value(report.current_md, ' m')} · {report.formation || 'Formation not found'}</strong></aside></div>
+    <div className="map-control-strip">
+      <div className="strip-well"><b>{report.well_name || 'Well name not found'}</b><small>{report.latitude!.toFixed(4)}, {report.longitude!.toFixed(4)}{validOffsets.length === 0 ? ' · no offset wells in document' : ''}</small></div>
+      <div className="strip-controls">
+        <label className="strip-group"><span>RADIUS</span><input type="range" min={5} max={50} step={5} value={radiusKm} onChange={(e) => setRadiusKm(Number(e.target.value))} /><strong>{radiusKm} km</strong></label>
+        <label className="strip-group"><span>FORMATION</span><select value={formationFilter} onChange={(e) => setFormationFilter(e.target.value)}><option value="all">All</option>{formationOptions.map(n => <option key={n} value={n}>{n}</option>)}</select></label>
+        {isFiltered && <button className="strip-reset" onClick={() => { setRadiusKm(25); setFormationFilter('all') }}>Reset</button>}
+        {onToggleFullscreen && <button className="strip-icon-btn" aria-label="Toggle fullscreen" onClick={onToggleFullscreen}>{fullscreen ? <X size={14} /> : <Maximize2 size={14} />}</button>}
+      </div>
+    </div></div>
 }
 
 function PdfViewer({ document }: { document: IndexedDocument }) {
@@ -696,11 +689,13 @@ function EmptyWorkspace({ view }: { view: View }) { const copy = view === 'docum
 function DocumentPanel({ document, processing, progress, status }: { document: IndexedDocument; processing: boolean; progress: number; status: string }) { return <><PanelHeader icon={<FileScan size={16} />} title="DOCUMENT INTELLIGENCE" meta={processing ? `${progress}%` : 'INDEXED'} /><div className="document-stage"><div className="paper"><PdfViewer document={document} /></div></div><div className="document-footer"><span><i className="live-dot" /> {status}</span><span>{document.segments.length} REGIONS · {document.pages} PAGES</span></div></> }
 
 function DepthPanel({ report, onOpenDive }: { report: Report; onOpenDive?: () => void }) {
+  const formations = report.formations?.length ? report.formations : report.formation ? [{ name: report.formation, top_md: null, bottom_md: null }] : []
   return <>
-    <PanelHeader icon={<Activity size={16} />} title="ACTIVE WELL · DIVE" meta={report.well_name || 'NAME NOT FOUND'} />
+    <PanelHeader icon={<Activity size={16} />} title="ACTIVE WELL" meta={report.well_name || 'NAME NOT FOUND'} />
     <div className="active-depth"><span>MEASURED DEPTH</span><strong>{value(report.current_md, ' m')}</strong><b>{report.formation || 'FORMATION NOT FOUND'}</b></div>
     <div className="extracted-metrics"><span><small>TVD</small><b>{value(report.current_tvd, ' m')}</b></span><span><small>PROGRESS</small><b>{value(report.progress, ' m')}</b></span><span><small>AVG ROP</small><b>{value(report.avg_rop, ' m/h')}</b></span><span><small>MUD WEIGHT</small><b>{value(report.mud_weight)}</b></span></div>
-    <WellDive report={report as never} compact onExpand={onOpenDive} />
+    <div className="formation-list">{formations.length ? formations.map((formation, index) => <div key={`${formation.name}-${index}`}><strong>{formation.name}</strong><span>{formation.top_md === null && formation.bottom_md === null ? 'Depth interval not stated' : `${value(formation.top_md, ' m')} – ${value(formation.bottom_md, ' m')}`}</span></div>) : <p>No formation intervals found in the document.</p>}</div>
+    {onOpenDive && <button className="coral-action" onClick={onOpenDive} style={{ margin: '0 14px 14px' }}><Waves size={14} /> OPEN WELL DIVE</button>}
   </>
 }
 
@@ -744,7 +739,11 @@ function StreamPanel({ document, status }: { document: IndexedDocument; status: 
 }
 
 function RiskRow({ risks, events, openPrediction }: { risks: Risk[]; events: Event[]; openPrediction: () => void }) {
-  return <section className="risk-row dynamic-risk-row"><div className="risk-label"><AlertTriangle size={25} /><div><small>DOCUMENT EVIDENCE</small><strong>RISK WATCH</strong></div></div>{risks.length ? risks.slice(0, 4).map((risk) => <button className={`risk-card ${risk.trend === 'rising' ? 'critical' : 'warning'}`} key={risk.label} title={risk.evidence}><div><small>{risk.label}</small><strong>{risk.probability === null ? '—' : `${risk.probability}%`}</strong><span className="risk-trend">TREND&nbsp; <b>{risk.trend || 'NOT STATED'}</b></span></div></button>) : <div className="no-risk-data">No risk probabilities were stated or extracted.</div>}<div className="alerts-card"><div><span className="alert-count">EVENTS ({events.length})</span>{events.slice(0, 2).map((event, index) => <span key={`${event.type}-${index}`}>{event.time || 'Time not stated'} · {event.type}{event.depth === null ? '' : ` @ ${event.depth.toLocaleString()} m`}</span>)}</div><button onClick={openPrediction}>ASK ABOUT EVENTS <ArrowUpRight size={13} /></button></div></section>
+  const shown = risks.slice(0, 4)
+  return <section className="risk-row dynamic-risk-row"><div className="risk-label"><AlertTriangle size={22} /><div><small>DOCUMENT EVIDENCE</small><strong>RISK WATCH</strong></div><span className="risk-count">{risks.length ? `${risks.length} TRACKED` : 'NO DATA'}</span></div><div className="risk-cards">{shown.length ? shown.map((risk) => {
+    const tone = risk.trend === 'rising' ? 'critical' : risk.trend === 'falling' ? 'calm' : 'warning'
+    return <button className={`risk-card ${tone}`} key={risk.label} title={risk.evidence}><span className="risk-top"><small>{risk.label}</small><i className={`risk-dot ${risk.trend || ''}`} /></span><strong>{risk.probability === null ? '—' : <>{risk.probability}<em>%</em></>}</strong><span className={`risk-pill ${risk.trend || 'none'}`}>{risk.trend || 'NOT STATED'}</span></button>
+  }) : <div className="no-risk-data">No risk probabilities were stated or extracted.</div>}</div><div className="alerts-card"><span className="alert-count">EVENTS ({events.length})</span><div className="alerts-list">{events.length ? events.slice(0, 2).map((event, index) => <span className="alert-row" key={`${event.type}-${index}`}><b>{event.time || '—'}</b> · {event.type}{event.depth === null ? '' : ` @ ${event.depth.toLocaleString()} m`}</span>) : <span className="alerts-empty">No events extracted</span>}</div><button onClick={openPrediction}>ASK ABOUT EVENTS <ArrowUpRight size={13} /></button></div></section>
 }
 
 function Sparkline({ values, color = '#e86b4d' }: { values: (number | null)[]; color?: string }) {
@@ -1069,7 +1068,7 @@ export default function App() {
     }
     if (view === 'prediction') return <div className="view-grid prediction-view"><div className="panel prediction-panel large"><PredictionPanel document={document} question={question} setQuestion={setQuestion} /></div><div className="panel panel-copy"><PanelHeader icon={<Bell size={16} />} title="EXTRACTED EVENTS" meta={`${report.events.length} FOUND`} /><div className="alert-log">{report.events.length ? report.events.map((event, index) => <span key={`${event.type}-${index}`}><b>{event.time || '—'}</b>{event.type}{event.depth === null ? '' : ` · ${event.depth.toLocaleString()} m`}</span>) : <span>No operational events found.</span>}</div></div></div>
     if (view === 'dive') return <div className="view-grid dive-view"><div className="panel dive-panel"><PanelHeader icon={<Waves size={16} />} title="WELL DIVE — PARALLAX SHAFT" meta={`${report.well_name || 'ACTIVE WELL'} · ${value(report.current_md, ' m')} · ${report.formation || 'FORMATION'}`} /><WellDive report={report as never} /></div><div className="panel panel-copy dive-copy"><PanelHeader icon={<Activity size={16} />} title="DIVE CONTEXT" meta={`${report.formations?.length || 0} FORMATIONS · ${report.events.length} EVENTS`} /><div className="dive-stats"><span><small>CURRENT FORMATION</small><b>{report.formation || 'Not found'}</b></span><span><small>DEEPEST MD</small><b>{value(report.current_md, ' m')}</b></span><span><small>TVD</small><b>{value(report.current_tvd, ' m')}</b></span><span><small>MUD WEIGHT</small><b>{value(report.mud_weight)}</b></span></div><div className="formation-list" style={{ margin: '14px 17px' }}>{(report.formations?.length ? report.formations : report.formation ? [{ name: report.formation, top_md: null, bottom_md: null }] : []).map((f, i) => <div key={`${f.name}-${i}`}><strong>{f.name}</strong><span>{f.top_md === null && f.bottom_md === null ? 'Depth interval not stated' : `${value(f.top_md, ' m')} – ${value(f.bottom_md, ' m')}`}</span></div>)}</div><div className="dive-events"><b>Depth-tagged events</b>{report.events.filter(e => e.depth !== null).slice(0, 5).map((e, i) => <span key={i}><small>{e.depth} m</small><strong>{e.type}</strong><em>{e.severity || '—'}</em></span>)}{report.events.filter(e => e.depth !== null).length === 0 && <small style={{ color: '#9a9e9c' }}>No depth-tagged events in this report</small>}</div><button className="coral-action" onClick={() => setView('command')} style={{ marginTop: 12 }}><Crosshair size={14} /> Back to Command Center</button></div></div>
-    return <><div className="hero-grid"><div className={`panel map-panel ${fullscreen ? 'map-panel-fullscreen' : ''}`}><PanelHeader icon={<MapPinned size={16} />} title="DOCUMENT WELL LOCATIONS" meta={report.latitude === null || report.longitude === null ? 'COORDINATES NOT FOUND' : `${1 + report.offset_wells.filter((well) => well.latitude !== null && well.longitude !== null).length} MAPPED`} /><div className="map-toolbar"><span style={{ flex: 1 }} /><button className="icon-button" aria-label="Toggle fullscreen" onClick={toggleFullscreen}>{fullscreen ? <X size={15} /> : <Maximize2 size={15} />}</button></div><FieldMap report={report} fullscreen={fullscreen} /></div><div className="panel depth-panel"><DepthPanel report={report} onOpenDive={() => setView('dive')} /></div><div className="panel document-panel"><DocumentPanel document={document} processing={processing} progress={progress} status={status} /></div></div><RiskRow risks={report.risks || []} events={report.events || []} openPrediction={() => setView('prediction')} /><TelemetryPanel report={report} /><div className="lower-grid"><div className="panel activity-panel"><StreamPanel document={document} status={status} /></div><div className="panel prediction-panel"><PredictionPanel document={document} question={question} setQuestion={setQuestion} /></div></div></>
+    return <><div className="hero-grid"><div className={`panel map-panel ${fullscreen ? 'map-panel-fullscreen' : ''}`}><PanelHeader icon={<MapPinned size={16} />} title="DOCUMENT WELL LOCATIONS" meta={report.latitude === null || report.longitude === null ? 'COORDINATES NOT FOUND' : `${1 + report.offset_wells.filter((well) => well.latitude !== null && well.longitude !== null).length} MAPPED`} /><FieldMap report={report} fullscreen={fullscreen} onToggleFullscreen={toggleFullscreen} /></div><div className="panel depth-panel"><DepthPanel report={report} onOpenDive={() => setView('dive')} /></div><div className="panel document-panel"><DocumentPanel document={document} processing={processing} progress={progress} status={status} /></div></div><RiskRow risks={report.risks || []} events={report.events || []} openPrediction={() => setView('prediction')} /><TelemetryPanel report={report} /><div className="lower-grid"><div className="panel activity-panel"><StreamPanel document={document} status={status} /></div><div className="panel prediction-panel"><PredictionPanel document={document} question={question} setQuestion={setQuestion} /></div></div></>
   }
   const heading = view === 'command' ? 'Operational evidence from uploaded documents.' : view === 'dive' ? 'Plunge through the well — parallax strata, drill, and events.' : view === 'documents' ? 'Make every report searchable.' : view === 'embeddings' ? 'Explore this document’s evidence.' : 'Ask against indexed evidence.'
   function onDragOver(event: React.DragEvent) { event.preventDefault(); if (!dragOver) setDragOver(true) }
