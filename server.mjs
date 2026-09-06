@@ -6,6 +6,7 @@ import { Groq } from 'groq-sdk'
 import { pipeline } from '@huggingface/transformers'
 import { GoogleGenAI } from '@google/genai'
 import { createClient } from '@supabase/supabase-js'
+import { normalizeExtractedReport } from './server/report-normalization.mjs'
 
 const supabaseUrl = process.env.SUPABASE_URL || process.env.VITE_SUPABASE_URL || ''
 const supabaseServiceKey = process.env.SUPABASE_SERVICE_ROLE_KEY || process.env.SUPABASE_ANON_KEY || process.env.VITE_SUPABASE_ANON_KEY || ''
@@ -139,6 +140,8 @@ function fallbackReport(text, headings) {
     progress: num('Progress'),
     avg_rop: num('Avg ROP'),
     formations: [],
+    trajectory: [],
+    casings: [],
     events: [],
     risks: [],
     offset_wells: [],
@@ -330,8 +333,9 @@ app.post('/api/structure-ddr', async (req, res) => {
     const structureMessages = [
       { role: 'system', content: 'You extract factual oil and gas drilling data. Never infer missing values. Use null or [] when the document does not explicitly contain a value. Return JSON only.' },
       { role: 'user', content: `Extract this drilling document using this exact schema:
-{"well_name":string|null,"report_date":string|null,"report_number":string|null,"latitude":number|null,"longitude":number|null,"current_md":number|null,"current_tvd":number|null,"formation":string|null,"mud_weight":string|null,"operator":string|null,"rig_name":string|null,"lease_block":string|null,"progress":number|null,"avg_rop":number|null,"formations":[{"name":string,"top_md":number|null,"bottom_md":number|null}],"events":[{"time":string|null,"type":string,"depth":number|null,"severity":"high"|"medium"|"low"|null,"mitigation":string|null,"evidence":string}],"risks":[{"label":string,"probability":number|null,"trend":"rising"|"steady"|"falling"|null,"evidence":string}],"offset_wells":[{"id":string,"latitude":number|null,"longitude":number|null,"depth":number|null,"distance_km":number|null,"relationship":string|null}],"sections":[{"label":string,"anchor":string,"summary":string,"evidence":string}]}
+{"well_name":string|null,"report_date":string|null,"report_number":string|null,"latitude":number|null,"longitude":number|null,"current_md":number|null,"current_tvd":number|null,"formation":string|null,"mud_weight":string|null,"operator":string|null,"rig_name":string|null,"lease_block":string|null,"progress":number|null,"avg_rop":number|null,"formations":[{"name":string,"top_md":number|null,"bottom_md":number|null}],"trajectory":[{"md":number,"tvd":number|null,"inclination":number|null,"azimuth":number|null,"northing":number|null,"easting":number|null}],"casings":[{"name":string,"top_md":number|null,"bottom_md":number|null,"diameter_in":number|null}],"events":[{"time":string|null,"type":string,"depth":number|null,"severity":"high"|"medium"|"low"|null,"mitigation":string|null,"evidence":string}],"risks":[{"label":string,"probability":number|null,"trend":"rising"|"steady"|"falling"|null,"evidence":string}],"offset_wells":[{"id":string,"latitude":number|null,"longitude":number|null,"depth":number|null,"distance_km":number|null,"relationship":string|null}],"sections":[{"label":string,"anchor":string,"summary":string,"evidence":string}]}
 Probability must be null unless the document explicitly states a percentage. Preserve coordinate signs. Do not invent offset wells, depths, events, formations, or risks.
+The Code column in a chronological activity table is an activity code, never an event type. Do not create events named P, D, NPT, WOC, TRIP, REAM, CIRC, or SURVEY. Routine drilling, circulating, conditioning, surveys, connections, trips, and reaming are not events. Create an event only for an explicitly stated anomaly, hazard, interruption, or remedial action; name it from the Operational Description (for example, Cement channeling or Cement squeeze).
 The OCR layout detector found these top-level headings: ${JSON.stringify(headingCandidates)}
 sections MUST contain exactly one entry for every heading in that list, in document order. anchor must exactly copy that heading. label may normalize capitalization but not meaning. evidence must be a concise verbatim excerpt from that section.
 OCR TEXT:\n${text}` },
@@ -358,8 +362,9 @@ OCR TEXT:\n${text}` },
             messages: [
               { role: 'system', content: 'You extract factual oil and gas drilling data. Never infer missing values. Use null or [] when the document does not explicitly contain a value. Return JSON only.' },
               { role: 'user', content: `Extract this drilling document using this exact schema:
-{"well_name":string|null,"report_date":string|null,"report_number":string|null,"latitude":number|null,"longitude":number|null,"current_md":number|null,"current_tvd":number|null,"formation":string|null,"mud_weight":string|null,"operator":string|null,"rig_name":string|null,"lease_block":string|null,"progress":number|null,"avg_rop":number|null,"formations":[{"name":string,"top_md":number|null,"bottom_md":number|null}],"events":[{"time":string|null,"type":string,"depth":number|null,"severity":"high"|"medium"|"low"|null,"mitigation":string|null,"evidence":string}],"risks":[{"label":string,"probability":number|null,"trend":"rising"|"steady"|"falling"|null,"evidence":string}],"offset_wells":[{"id":string,"latitude":number|null,"longitude":number|null,"depth":number|null,"distance_km":number|null,"relationship":string|null}],"sections":[{"label":string,"anchor":string,"summary":string,"evidence":string}]}
+{"well_name":string|null,"report_date":string|null,"report_number":string|null,"latitude":number|null,"longitude":number|null,"current_md":number|null,"current_tvd":number|null,"formation":string|null,"mud_weight":string|null,"operator":string|null,"rig_name":string|null,"lease_block":string|null,"progress":number|null,"avg_rop":number|null,"formations":[{"name":string,"top_md":number|null,"bottom_md":number|null}],"trajectory":[{"md":number,"tvd":number|null,"inclination":number|null,"azimuth":number|null,"northing":number|null,"easting":number|null}],"casings":[{"name":string,"top_md":number|null,"bottom_md":number|null,"diameter_in":number|null}],"events":[{"time":string|null,"type":string,"depth":number|null,"severity":"high"|"medium"|"low"|null,"mitigation":string|null,"evidence":string}],"risks":[{"label":string,"probability":number|null,"trend":"rising"|"steady"|"falling"|null,"evidence":string}],"offset_wells":[{"id":string,"latitude":number|null,"longitude":number|null,"depth":number|null,"distance_km":number|null,"relationship":string|null}],"sections":[{"label":string,"anchor":string,"summary":string,"evidence":string}]}
 Probability must be null unless the document explicitly states a percentage. Preserve coordinate signs. Do not invent offset wells, depths, events, formations, or risks.
+The Code column in a chronological activity table is an activity code, never an event type. Do not create events named P, D, NPT, WOC, TRIP, REAM, CIRC, or SURVEY. Routine drilling, circulating, conditioning, surveys, connections, trips, and reaming are not events. Create an event only for an explicitly stated anomaly, hazard, interruption, or remedial action; name it from the Operational Description (for example, Cement channeling or Cement squeeze).
 The OCR layout detector found these top-level headings: ${JSON.stringify(headingCandidates)}
 sections MUST contain exactly one entry for every heading in that list, in document order. anchor must exactly copy that heading. label may normalize capitalization but not meaning. evidence must be a concise verbatim excerpt from that section.
 OCR TEXT:\n${text}` },
@@ -377,6 +382,7 @@ OCR TEXT:\n${text}` },
       }
     }
     }
+    report = normalizeExtractedReport(report)
     // Ensure sections align with detected headings – groq may still miss one if OCR is noisy
     let sections = Array.isArray(report.sections) ? report.sections : []
     if (headingCandidates.length && sections.length !== headingCandidates.length) {

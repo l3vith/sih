@@ -28,7 +28,11 @@ test('Metal OCR adapter: text fidelity, image sizing, busy state, failures and r
     if (mode === 'length') return res.status(422).json({ detail: 'OCR reached its output limit.' })
     if (mode === 'busy') return res.status(429).json({ detail: 'Model busy.' })
     if (mode === 'bad') return res.json({ text: 42 })
-    res.json({ text: mode === 'blank' ? '' : transcription, engine: 'GLM-OCR', model: 'mlx-community/GLM-OCR-bf16' })
+    res.json({
+      text: mode === 'blank' ? '' : transcription,
+      words: [{ text: 'Well D-05', bbox: { x0: 110, y0: 75, x1: 510, y1: 145 }, confidence: 0.94 }],
+      engine: 'GLM-OCR', localizationEngine: 'Apple Vision', model: 'mlx-community/GLM-OCR-bf16',
+    })
   })
   const upstream = await listen(mock)
   process.env.MLX_OCR_URL = upstream.url
@@ -49,7 +53,9 @@ test('Metal OCR adapter: text fidelity, image sizing, busy state, failures and r
     assert.equal(result.text, transcription)
     assert.equal(result.width, 2200)
     assert.equal(result.height, 1100)
-    assert.deepEqual(result.words, []) // Never fabricate localized VLM boxes.
+    assert.equal(result.words.length, 1)
+    assert.deepEqual(result.words[0].bbox, { x0: 110, y0: 75, x1: 510, y1: 145 })
+    assert.equal(result.localizationEngine, 'Apple Vision')
     assert.equal(result.confidence, undefined)
     assert.equal(result.engine, 'GLM-OCR')
     const decoded = await sharp(Buffer.from(captured.imageBase64, 'base64')).metadata()

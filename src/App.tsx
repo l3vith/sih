@@ -1,4 +1,4 @@
-import { useEffect, useMemo, useRef, useState } from 'react'
+import { lazy, Suspense, useEffect, useMemo, useRef, useState } from 'react'
 import type { ChangeEvent, FormEvent, ReactNode } from 'react'
 import { Map as MapLibreMap, NavigationControl, Popup, setWorkerUrl, type StyleSpecification } from 'maplibre-gl'
 import maplibreWorkerUrl from 'maplibre-gl/dist/maplibre-gl-worker.mjs?url'
@@ -12,9 +12,12 @@ import pdfWorkerUrl from 'pdfjs-dist/build/pdf.worker.min.mjs?url'
 setWorkerUrl(maplibreWorkerUrl)
 import { Activity, AlertTriangle, Anchor, ArrowUpRight, Bell, BrainCircuit, ChevronDown, CircleHelp, Crosshair, Database, FileScan, FileText, Flame, Gauge, MapPinned, LoaderCircle, Maximize2, Menu, Network, PanelLeftClose, Pause, Play, RotateCcw, Search, Send, Settings2, Sparkles, Upload, Waves, X, Zap } from 'lucide-react'
 import WellDive from './components/WellDive'
+import AllDocumentsMap from './components/AllDocumentsMap'
 import { isSupabaseConfigured, loadDocumentsFromSupabase, saveAlert as saveAlertToSupabase, saveDocumentToSupabase, saveTelemetryBatch, supabase, upsertWellFromReport } from './lib/supabase'
 
 GlobalWorkerOptions.workerSrc = pdfWorkerUrl
+const DocumentGraph = lazy(() => import('./components/DocumentGraph'))
+const SubsurfaceView = lazy(() => import('./components/SubsurfaceView'))
 
 type View = 'command' | 'documents' | 'embeddings' | 'prediction' | 'dive'
 type Segment = { page: number; x: number; y: number; w: number; h: number; label: string; tone: 'cyan' | 'amber' | 'coral' }
@@ -23,12 +26,14 @@ type Event = { time: string | null; type: string; depth: number | null; severity
 type Risk = { label: string; probability: number | null; trend: 'rising' | 'steady' | 'falling' | null; evidence: string }
 type OffsetWell = { id: string; latitude: number | null; longitude: number | null; depth: number | null; distance_km: number | null; relationship: string | null }
 type Formation = { name: string; top_md: number | null; bottom_md: number | null }
+type SurveyPoint = { md: number; tvd: number | null; inclination: number | null; azimuth: number | null; northing: number | null; easting: number | null }
+type Casing = { name: string; top_md: number | null; bottom_md: number | null; diameter_in: number | null }
 type Section = { label: string; anchor: string; summary: string; evidence?: string }
 type Report = {
   well_name: string | null; report_date: string | null; report_number: string | null; latitude: number | null; longitude: number | null;
   current_md: number | null; current_tvd: number | null; formation: string | null; mud_weight: string | null; operator: string | null;
   rig_name: string | null; lease_block: string | null; progress: number | null; avg_rop: number | null; formations: Formation[];
-  events: Event[]; risks: Risk[]; offset_wells: OffsetWell[]; sections: Section[];
+  events: Event[]; risks: Risk[]; offset_wells: OffsetWell[]; sections: Section[]; trajectory?: SurveyPoint[]; casings?: Casing[];
 }
 type Analysis = { report: Report; segments: Segment[]; embeddings: Embedding[]; embeddingModel: string; corpus: string; documentVector: number[] | null }
 type IndexedDocument = Analysis & { name: string; url: string; pages: number }
@@ -920,23 +925,18 @@ export default function App() {
     } finally { ingestingRef.current = false; setProcessing(false) }
   }
   const report = document?.report
-  const navItems: [View, ReactNode, string][] = [['command', <Crosshair size={17} />, 'Command Center'], ['dive', <Waves size={17} />, 'Well Dive'], ['documents', <FileScan size={17} />, 'Documents'], ['embeddings', <Network size={17} />, 'Embedding Explorer'], ['prediction', <BrainCircuit size={17} />, 'Prediction Mode']]
+  const navItems: [View, ReactNode, string][] = [['command', <Crosshair size={17} />, 'Command Center'], ['dive', <Waves size={17} />, 'Well Dive'], ['documents', <FileScan size={17} />, 'Documents'], ['embeddings', <Network size={17} />, 'Document Graph'], ['prediction', <BrainCircuit size={17} />, 'Prediction Mode']]
   function renderView() {
     if (documents.length === 0) return processing ? null : <EmptyWorkspace view={view} />
     if (!document || !report) return <EmptyWorkspace view={view} />
     if (view === 'documents') return <div className="view-grid documents-view"><div className="panel document-panel"><DocumentPanel document={document} processing={processing} progress={progress} status={status} /></div><div className="panel activity-panel"><StreamPanel document={document} status={status} /></div></div>
-    if (view === 'embeddings') {
-      const activeDoc = document
-      return <div className="view-grid embeddings-view"><div className="panel embeddings-panel"><EmbeddingPanel documents={documents} /></div><div className="panel panel-copy"><PanelHeader icon={<MapPinned size={16} />} title="DRILLING SITES" meta={`${documents.length} SITES INDEXED`} /><h2>{activeDoc.report.well_name ?? activeDoc.name}</h2><p>{activeDoc.report.lease_block ?? 'No lease/block'} · {activeDoc.report.formation ?? 'Formation not stated'} · Click a point to switch active site. Similar sites cluster closer.</p><div className="linked-well-list">{documents.map((doc) => {
-        const isActive = doc.name === activeDoc.name
-        return <button key={doc.name} className={isActive ? 'selected' : ''} onClick={() => setActiveName(doc.name)}><span>{doc.report.well_name ?? doc.name}</span><small>{value(doc.report.current_md, ' m')} · {doc.report.formation ?? '—'} · {doc.report.lease_block ?? ''}</small><ArrowUpRight size={14} /></button>
-      })}</div><p style={{ margin: '10px 17px', fontSize: 8, color: '#9a9e9c' }}>{documents[0]?.embeddingModel ?? ''} · cosine similarity · semanticProjection (PCA Gram)</p></div></div>
-    }
+    if (view === 'embeddings') return <section className="panel"><PanelHeader icon={<Network size={16} />} title="DOCUMENT GRAPH" meta={`${documents.length} DOCUMENTS`} /><Suspense fallback={<div className="subsurface-loading">Loading document graph…</div>}><DocumentGraph documents={documents} activeName={document.name} onSelect={setActiveName} /></Suspense></section>
     if (view === 'prediction') return <div className="view-grid prediction-view"><div className="panel prediction-panel large"><PredictionPanel document={document} question={question} setQuestion={setQuestion} /></div><div className="panel panel-copy"><PanelHeader icon={<Bell size={16} />} title="EXTRACTED EVENTS" meta={`${report.events.length} FOUND`} /><div className="alert-log">{report.events.length ? report.events.map((event, index) => <span key={`${event.type}-${index}`}><b>{event.time || '—'}</b>{event.type}{event.depth === null ? '' : ` · ${event.depth.toLocaleString()} m`}</span>) : <span>No operational events found.</span>}</div></div></div>
     if (view === 'dive') return <div className="view-grid dive-view"><div className="panel dive-panel"><PanelHeader icon={<Waves size={16} />} title="WELL DIVE — PARALLAX SHAFT" meta={`${report.well_name || 'ACTIVE WELL'} · ${value(report.current_md, ' m')} · ${report.formation || 'FORMATION'}`} /><WellDive report={report as never} /></div><div className="panel panel-copy dive-copy"><PanelHeader icon={<Activity size={16} />} title="DIVE CONTEXT" meta={`${report.formations?.length || 0} FORMATIONS · ${report.events.length} EVENTS`} /><div className="dive-stats"><span><small>CURRENT FORMATION</small><b>{report.formation || 'Not found'}</b></span><span><small>DEEPEST MD</small><b>{value(report.current_md, ' m')}</b></span><span><small>TVD</small><b>{value(report.current_tvd, ' m')}</b></span><span><small>MUD WEIGHT</small><b>{value(report.mud_weight)}</b></span></div><div className="formation-list" style={{ margin: '14px 17px' }}>{(report.formations?.length ? report.formations : report.formation ? [{ name: report.formation, top_md: null, bottom_md: null }] : []).map((f, i) => <div key={`${f.name}-${i}`}><strong>{f.name}</strong><span>{f.top_md === null && f.bottom_md === null ? 'Depth interval not stated' : `${value(f.top_md, ' m')} – ${value(f.bottom_md, ' m')}`}</span></div>)}</div><div className="dive-events"><b>Depth-tagged events</b>{report.events.filter(e => e.depth !== null).slice(0, 5).map((e, i) => <span key={i}><small>{e.depth} m</small><strong>{e.type}</strong><em>{e.severity || '—'}</em></span>)}{report.events.filter(e => e.depth !== null).length === 0 && <small style={{ color: '#9a9e9c' }}>No depth-tagged events in this report</small>}</div><button className="coral-action" onClick={() => setView('command')} style={{ marginTop: 12 }}><Crosshair size={14} /> Back to Command Center</button></div></div>
-    return <><div className="hero-grid"><div className={`panel map-panel ${fullscreen ? 'map-panel-fullscreen' : ''}`}><PanelHeader icon={<MapPinned size={16} />} title="DOCUMENT WELL LOCATIONS" meta={report.latitude === null || report.longitude === null ? 'COORDINATES NOT FOUND' : `${1 + report.offset_wells.filter((well) => well.latitude !== null && well.longitude !== null).length} MAPPED`} /><FieldMap report={report} fullscreen={fullscreen} onToggleFullscreen={toggleFullscreen} /></div><div className="panel depth-panel"><DepthPanel report={report} onOpenDive={() => setView('dive')} /></div><div className="panel document-panel"><DocumentPanel document={document} processing={processing} progress={progress} status={status} /></div></div><RiskRow risks={report.risks || []} events={report.events || []} openPrediction={() => setView('prediction')} /><TelemetryPanel report={report} /><div className="lower-grid"><div className="panel activity-panel"><StreamPanel document={document} status={status} /></div><div className="panel prediction-panel"><PredictionPanel document={document} question={question} setQuestion={setQuestion} /></div></div></>
+    const locatedDocuments = documents.filter((doc) => Number.isFinite(doc.report.latitude) && Number.isFinite(doc.report.longitude)).length
+    return <><div className="hero-grid"><div className="panel map-panel"><PanelHeader icon={<MapPinned size={16} />} title="UPLOADED DOCUMENT LOCATIONS" meta={`${locatedDocuments} OF ${documents.length} MAPPED`} /><AllDocumentsMap documents={documents} activeName={document.name} onSelect={setActiveName} /></div><div className="panel depth-panel"><DepthPanel report={report} onOpenDive={() => setView('dive')} /></div><div className="panel document-panel"><DocumentPanel document={document} processing={processing} progress={progress} status={status} /></div></div><section className="panel subsurface-panel"><PanelHeader icon={<Waves size={16} />} title="SUBSURFACE 3D" meta={`${report.well_name || document.name} · VIDEX 3D`} /><Suspense fallback={<div className="subsurface-loading"><LoaderCircle className="ocr-spinner" size={22} /> Loading subsurface renderer…</div>}><SubsurfaceView report={report} /></Suspense></section><RiskRow risks={report.risks || []} events={report.events || []} openPrediction={() => setView('prediction')} /><TelemetryPanel report={report} /><div className="lower-grid"><div className="panel activity-panel"><StreamPanel document={document} status={status} /></div><div className="panel prediction-panel"><PredictionPanel document={document} question={question} setQuestion={setQuestion} /></div></div></>
   }
-  const heading = view === 'command' ? 'Operational evidence from uploaded documents.' : view === 'dive' ? 'Plunge through the well — parallax strata, drill, and events.' : view === 'documents' ? 'Make every report searchable.' : view === 'embeddings' ? 'Explore this document’s evidence.' : 'Ask against indexed evidence.'
+  const heading = view === 'command' ? 'Operational evidence from uploaded documents.' : view === 'dive' ? 'Plunge through the well — parallax strata, drill, and events.' : view === 'documents' ? 'Make every report searchable.' : view === 'embeddings' ? 'Explore connections between your documents.' : 'Ask against indexed evidence.'
   function onDragOver(event: React.DragEvent) { event.preventDefault(); if (!dragOver) setDragOver(true) }
   function onDragLeave(event: React.DragEvent) { if (!(event.currentTarget as HTMLElement).contains(event.relatedTarget as Node)) setDragOver(false) }
   async function onDrop(event: React.DragEvent) { event.preventDefault(); setDragOver(false); const files = event.dataTransfer.files; if (files && files.length) await ingestFiles(files) }

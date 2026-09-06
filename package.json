@@ -12,15 +12,19 @@
     "ocr:start": "node scripts/ocr-runtime.mjs start",
     "ocr:stop": "node scripts/ocr-runtime.mjs stop",
     "ocr:logs": "node scripts/ocr-runtime.mjs logs",
-    "test:ocr": "node --test server/mlx-ocr.test.mjs",
+    "test:ocr": "node --test server/mlx-ocr.test.mjs server/report-normalization.test.mjs",
     "ocr:setup": "node scripts/ocr-runtime.mjs setup",
     "ocr:status": "node scripts/ocr-runtime.mjs status"
   },
   "dependencies": {
+    "@equinor/videx-3d": "^3.2.2",
     "@google/genai": "^2.21.0",
     "@huggingface/transformers": "^4.2.0",
+    "@react-three/drei": "^10.7.8",
+    "@react-three/fiber": "^9.7.0",
     "@supabase/supabase-js": "^2.115.0",
     "@vitejs/plugin-react": "latest",
+    "comlink": "^4.4.2",
     "cors": "^2.8.6",
     "dotenv": "^17.4.2",
     "express": "^5.2.1",
@@ -32,6 +36,7 @@
     "react": "latest",
     "react-dom": "latest",
     "sharp": "^0.34.5",
+    "three": "^0.179.1",
     "typescript": "latest",
     "vite": "latest"
   },

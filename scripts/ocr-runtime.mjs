@@ -10,6 +10,8 @@ const pidFile = path.join(runtime, 'runtime.pid')
 const logFile = path.join(runtime, 'runtime.log')
 const python = path.join(root, '.venv-ocr', 'bin', 'python')
 const service = path.join(root, 'ocr', 'service.py')
+const visionSource = path.join(root, 'ocr', 'vision_boxes.swift')
+const visionBinary = path.join(runtime, 'vision-ocr')
 const action = process.argv[2] || 'status'
 
 async function ownedPid() {
@@ -30,9 +32,11 @@ function run(command, args) {
 try {
   if (process.platform !== 'darwin' || process.arch !== 'arm64') throw new Error('The local OCR runtime requires an Apple Silicon Mac.')
   if (action === 'setup') {
+    await mkdir(runtime, { recursive: true })
     try { await access(python) } catch { run('uv', ['venv', '.venv-ocr', '--python', '3.12']) }
     run('uv', ['pip', 'install', '--python', python, '-r', 'ocr/requirements.lock.txt'])
-    console.log('OCR environment installed. Run npm run ocr:start to download and load GLM-OCR.')
+    run('xcrun', ['swiftc', '-O', visionSource, '-o', visionBinary, '-framework', 'Vision', '-framework', 'AppKit', '-framework', 'ImageIO'])
+    console.log('OCR environment and Apple Vision localization installed. Run npm run ocr:start to download and load GLM-OCR.')
   } else if (action === 'start') {
     if (await ownedPid()) { console.log('OCR runtime already started. Use npm run ocr:status to check readiness.'); process.exit(0) }
     try { await access(python) } catch { throw new Error('Run npm run ocr:setup first (requires uv).') }

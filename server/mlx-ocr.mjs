@@ -38,10 +38,12 @@ export function installMlxOcr(app) {
       })
       const payload = await response.json().catch(() => null)
       if (!response.ok) return res.status([400, 422, 429, 503].includes(response.status) ? response.status : 502).json({ error: typeof payload?.detail === 'string' ? payload.detail : `Local GLM-OCR returned HTTP ${response.status}. Check npm run ocr:logs.` })
-      if (typeof payload?.text !== 'string' || payload.engine !== 'GLM-OCR') throw new Error('GLM-OCR returned an invalid response.')
-      // GLM's recognition mode produces Markdown text, not localized regions.
-      // Keep the existing contract without manufacturing boxes or confidence.
-      res.json({ text: payload.text.trim(), words: [], width: info.width, height: info.height, engine: 'GLM-OCR', model: payload.model, device: 'metal' })
+      if (typeof payload?.text !== 'string' || payload.engine !== 'GLM-OCR' || !Array.isArray(payload.words)) throw new Error('GLM-OCR returned an invalid response.')
+      const words = payload.words.filter((word) =>
+        typeof word?.text === 'string' &&
+        ['x0', 'y0', 'x1', 'y1'].every((key) => Number.isFinite(word?.bbox?.[key]))
+      )
+      res.json({ text: payload.text.trim(), words, width: info.width, height: info.height, engine: 'GLM-OCR', localizationEngine: payload.localizationEngine, model: payload.model, device: 'metal' })
     } catch (error) {
       const message = error.message === 'fetch failed' ? unavailable : error.name === 'TimeoutError' ? 'GLM-OCR timed out. The current page may still be running; check OCR status before retrying.' : error.message
       res.status(error.name === 'TimeoutError' ? 504 : 502).json({ error: message })

@@ -6,6 +6,9 @@ import io
 import logging
 import os
 import platform
+import json
+import subprocess
+import tempfile
 from concurrent.futures import ThreadPoolExecutor
 from contextlib import asynccontextmanager
 
@@ -14,6 +17,10 @@ from pydantic import BaseModel, Field
 from PIL import Image, UnidentifiedImageError
 
 MODEL_ID = os.environ.get("MLX_OCR_MODEL", "mlx-community/GLM-OCR-bf16")
+VISION_BINARY = os.environ.get(
+    "VISION_OCR_BINARY",
+    os.path.join(os.path.dirname(os.path.dirname(__file__)), ".local", "ocr", "vision-ocr"),
+)
 MAX_TOKENS = int(os.environ.get("MLX_OCR_MAX_TOKENS", "8192"))
 Image.MAX_IMAGE_PIXELS = 40_000_000
 log = logging.getLogger("uvicorn.error")
@@ -66,7 +73,26 @@ def recognize(encoded):
         result = generate(model, processor, prompt, image=[image], max_tokens=MAX_TOKENS, temperature=0.0, verbose=False)
         if result.generation_tokens >= MAX_TOKENS:
             raise HTTPException(422, "OCR reached its output limit. Split this dense page into smaller images and retry.")
-        return {"text": result.text.strip(), "engine": "GLM-OCR", "model": MODEL_ID, "device": "metal"}
+        if not os.path.isfile(VISION_BINARY) or not os.access(VISION_BINARY, os.X_OK):
+            raise HTTPException(503, "Apple Vision localization is not installed. Run npm run ocr:setup, then restart OCR.")
+        with tempfile.NamedTemporaryFile(suffix=".png") as page_file:
+            image.save(page_file, format="PNG")
+            page_file.flush()
+            localized = subprocess.run(
+                [VISION_BINARY, page_file.name], capture_output=True, text=True, timeout=120, check=False
+            )
+        if localized.returncode != 0:
+            log.error("Apple Vision localization failed: %s", localized.stderr.strip())
+            raise HTTPException(500, "Apple Vision could not localize text on this page.")
+        words = json.loads(localized.stdout)
+        return {
+            "text": result.text.strip(),
+            "words": words,
+            "engine": "GLM-OCR",
+            "localizationEngine": "Apple Vision",
+            "model": MODEL_ID,
+            "device": "metal",
+        }
     finally:
         image.close()
         mx.clear_cache()
