@@ -22,7 +22,9 @@ function Scanner({ onRead, onClose }: { onRead: (text: string) => Promise<void>;
       if (busy) return; busy = true
       try { await callback.current(result.data); setError('') } catch (e) { setError(String((e as Error).message)) } finally { busy = false }
     }, { returnDetailedScanResult: true, preferredCamera: 'environment', highlightScanRegion: true })
-    scanner.start().catch(() => setError('Camera unavailable. Allow camera access on HTTPS, or use an update file.'))
+    const secure = window.isSecureContext || ['localhost', '127.0.0.1'].includes(window.location.hostname)
+    if (!secure) { setError('Camera scanning requires HTTPS. Open the deployed NWIS site, or use Import update file.'); return () => scanner.destroy() }
+    scanner.start().catch(() => setError('Camera unavailable. Allow camera access in browser settings, then retry.'))
     return () => scanner.destroy()
   }, [])
   return <div className="field-scan"><video ref={video} playsInline muted /><p role="alert">{error}</p><button onClick={onClose}>Stop camera</button></div>
@@ -63,7 +65,9 @@ export default function FieldCompanion({ receiver = false, wells = [], reports =
   }
   async function readQr(value: string) {
     if (!receiver) {
-      const receipt = JSON.parse(value), sent = transfer.current || await get<FieldPackage>('nwis-field-pending-transfer')
+      let receipt: { kind?: string; version?: number; id?: string }
+      try { receipt = JSON.parse(value) } catch { return }
+      const sent = transfer.current || await get<FieldPackage>('nwis-field-pending-transfer')
       if (!sent || receipt.kind !== 'receipt' || receipt.version !== 1 || receipt.id !== sent.id) throw new Error('This confirmation does not match your last transfer.')
       const ids = new Set(sent.notes.map(n => n.id))
       await update<FieldNote[]>(NOTES, old => (old || []).map(n => ids.has(n.id) ? { ...n, received: true } : n))
