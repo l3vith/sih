@@ -12,7 +12,7 @@
     "ocr:start": "node scripts/ocr-runtime.mjs start",
     "ocr:stop": "node scripts/ocr-runtime.mjs stop",
     "ocr:logs": "node scripts/ocr-runtime.mjs logs",
-    "test:ocr": "node --test server/mlx-ocr.test.mjs server/report-normalization.test.mjs",
+    "test:ocr": "node --test server/*.test.mjs",
     "ocr:setup": "node scripts/ocr-runtime.mjs setup",
     "ocr:status": "node scripts/ocr-runtime.mjs status"
   },
@@ -36,6 +36,7 @@
     "react": "latest",
     "react-dom": "latest",
     "sharp": "^0.34.5",
+    "tesseract.js": "^7.0.0",
     "three": "^0.179.1",
     "typescript": "latest",
     "vite": "latest"

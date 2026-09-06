@@ -36,6 +36,17 @@ PDFs are rendered in the browser before OCR. PNG, JPEG, WebP and BMP images are 
 
 GLM-OCR's text-recognition mode returns text/Markdown **without localized bounding boxes or confidence scores**. The adapter returns `words: []`; the viewer indicates text OCR and does not invent section rectangles. Page markers remain in extracted evidence. Existing indexed documents retain their saved regions. Handwriting accuracy depends on scan quality and writing style; Hindi handwriting has not been validated.
 
+### Windows / non-Apple-Silicon fallback (Tesseract)
+
+The MLX service only runs on Apple Silicon. On Windows/Linux, `/api/ocr` uses a local **Tesseract LSTM** fallback instead — no system install, no cloud calls:
+
+```sh
+npm install   # includes tesseract.js
+npm run dev:all
+```
+
+Engine selection via `OCR_ENGINE` (`auto` default: MLX on macOS with Tesseract fallback if unreachable, Tesseract directly elsewhere; `mlx` / `tesseract` to force). `TESSERACT_LANGS` defaults to `eng+hin`. Language data downloads once into `TESSERACT_CACHE` (`.tesseract-cache/`, gitignored) and works offline afterwards. Responses carry `engine: "Tesseract"` (plus `fallback: true` when MLX was tried first), so the existing loader and structuring pipeline work unchanged. Expect lower accuracy than GLM-OCR, especially on handwriting — printed DDRs work best.
+
 ### Validation
 
 ```sh

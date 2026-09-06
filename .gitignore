@@ -4,5 +4,6 @@ dist/
 .DS_Store
 *.log
 .venv-ocr/
+.tesseract-cache/
 .local/
 __pycache__/

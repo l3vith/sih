@@ -36,6 +36,7 @@ test('Metal OCR adapter: text fidelity, image sizing, busy state, failures and r
   })
   const upstream = await listen(mock)
   process.env.MLX_OCR_URL = upstream.url
+  process.env.OCR_ENGINE = 'mlx' // pin MLX-only: preserves pre-fallback expectations below
   const app = express(); app.use(express.json()); installMlxOcr(app)
   const api = await listen(app)
   const post = body => fetch(`${api.url}/api/ocr`, { method: 'POST', headers: { 'content-type': 'application/json' }, body: JSON.stringify(body) })
@@ -78,5 +79,6 @@ test('Metal OCR adapter: text fidelity, image sizing, busy state, failures and r
     await close(api.server)
     if (upstream.server.listening) await close(upstream.server)
     delete process.env.MLX_OCR_URL
+    delete process.env.OCR_ENGINE
   }
 })
