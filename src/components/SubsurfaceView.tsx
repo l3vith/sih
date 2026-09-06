@@ -1,7 +1,7 @@
 import { useEffect, useMemo, useState } from 'react'
-import { Canvas } from '@react-three/fiber'
 import { Bounds, Html, OrbitControls } from '@react-three/drei'
 import { createTubeGeometry, getSplineCurve, type Vec3 } from '@equinor/videx-3d/sdk'
+import WebglSafe from './WebglSafe'
 
 type SurveyPoint = { md: number; tvd: number | null; inclination: number | null; azimuth: number | null; northing: number | null; easting: number | null }
 type Casing = { name: string; top_md: number | null; bottom_md: number | null; diameter_in: number | null }
@@ -98,7 +98,7 @@ export default function SubsurfaceView({ report }: { report: SubsurfaceReport })
   const trajectory = displaySamples.map((sample) => sample.point)
 
   return <div className="subsurface-shell">
-    <Canvas orthographic camera={{ position: [90, 30, 95], zoom: 6.2, near: 0.1, far: 1000 }} dpr={[1, 1.7]}>
+    <WebglSafe orthographic camera={{ position: [90, 30, 95], zoom: 6.2, near: 0.1, far: 1000 }} dpr={[1, 1.7]}>
       <color attach="background" args={['#eef5f3']} />
       <ambientLight intensity={1.25} />
       <directionalLight position={[35, 60, 45]} intensity={2.1} />
@@ -126,7 +126,7 @@ export default function SubsurfaceView({ report }: { report: SubsurfaceReport })
       <Html position={[0, 4, 0]} center><span className="subsurface-well-label">{report.well_name || 'Selected well'}</span></Html>
       </Bounds>
       <OrbitControls makeDefault target={[0, -34, 0]} enableDamping dampingFactor={0.08} />
-    </Canvas>
+    </WebglSafe>
     <button className="subsurface-scale-toggle" aria-pressed={expanded} onClick={() => setExpanded((value) => !value)}>{expanded ? 'Expanded layers · switch to true scale' : 'True scale · expand layers'}</button>
     {formations.length > 0 && <div className="subsurface-formations"><b>FORMATION TOPS</b>{formations.map((formation, index) => <span key={`${formation.name}-legend-${index}`}><i style={{ background: palette[index % palette.length] }} /><strong>{formation.name}</strong><small>{formation.top_md?.toLocaleString()} m</small></span>)}</div>}
     <div className="subsurface-legend"><span><i className="trajectory-key" /> Well path · width exaggerated</span><span><i className="horizon-key" /> Local formation intersections · horizontal extent illustrative</span><span>Depths in legend are MD</span>{formations.length > locatedFormations.length && <span>{formations.length - locatedFormations.length} tops outside survey coverage</span>}</div>

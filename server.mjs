@@ -358,13 +358,35 @@ OCR TEXT:\n${text}` },
     ]
     if (airgapped) {
       // Airgapped mode: local Osaurus LLM only — Google/Groq are never contacted.
+      // Transport failure (Osaurus down) and unparsable output are distinct errors:
+      // only the former means "unreachable". Small local models often emit
+      // malformed JSON, so retry once with a repair prompt, then use the
+      // offline regex fallback rather than failing the upload.
+      let osaurusContent = null
       try {
-        const osaurusContent = await osaurusChat({ messages: structureMessages, temperature: 0.05, max_tokens: 1500 })
+        osaurusContent = await osaurusChat({ messages: structureMessages, temperature: 0.05, max_tokens: 1500 })
+      } catch (osaurusErr) {
+        console.warn('[structure-ddr] Osaurus (airgapped) unreachable:', osaurusErr instanceof Error ? osaurusErr.message.slice(0, 300) : String(osaurusErr).slice(0, 300))
+        return res.status(503).json({ error: OSAURUS_DOWN })
+      }
+      try {
         report = jsonFrom(osaurusContent)
         console.log('[structure-ddr] Osaurus (airgapped) succeeded')
-      } catch (osaurusErr) {
-        console.warn('[structure-ddr] Osaurus (airgapped) failed:', osaurusErr instanceof Error ? osaurusErr.message.slice(0, 300) : String(osaurusErr).slice(0, 300))
-        return res.status(503).json({ error: OSAURUS_DOWN })
+      } catch (parseErr) {
+        console.warn('[structure-ddr] Osaurus (airgapped) returned invalid JSON, requesting repair:', parseErr instanceof Error ? parseErr.message.slice(0, 200) : String(parseErr).slice(0, 200))
+        try {
+          const repair = await osaurusChat({
+            messages: [...structureMessages,
+              { role: 'assistant', content: String(osaurusContent || '').slice(0, 6000) },
+              { role: 'user', content: `Your previous output was not valid JSON (${parseErr instanceof Error ? parseErr.message.slice(0, 200) : 'parse error'}). Return ONLY the corrected JSON object with the exact schema above. No prose, no code fences.` },
+            ], temperature: 0.05, max_tokens: 1500,
+          })
+          report = jsonFrom(repair)
+          console.log('[structure-ddr] Osaurus (airgapped) repair succeeded')
+        } catch (repairErr) {
+          console.warn('[structure-ddr] Osaurus repair failed, using offline regex fallback:', repairErr instanceof Error ? repairErr.message.slice(0, 200) : String(repairErr).slice(0, 200))
+          report = fallbackReport(text, headingCandidates)
+        }
       }
     } else try {
       // FIRST TRY: Google GenAI (gemma-4-26b-a4b-it) – has vision, best for handwritten

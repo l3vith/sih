@@ -269,6 +269,7 @@ const STR: Dict = {
   errCsvDepth: { en: 'CSV header must include depth or md', hi: 'CSV हेडर में depth या md होना चाहिए' },
   errCsv: { en: 'CSV parse failed', hi: 'CSV पार्स विफल' },
   errAsk: { en: 'Ask NWIS failed.', hi: 'NWIS से पूछना विफल।' },
+  errApiDown: { en: 'API server is not reachable or returned an unreadable response. Make sure the API is running (npm run dev:all) and retry.', hi: 'API सर्वर उपलब्ध नहीं है या उसने अपठनीय प्रतिक्रिया दी। सुनिश्चित करें कि API चल रहा है (npm run dev:all) और पुनः प्रयास करें।' },
   errWhatifNoRisks: { en: 'No risks were extracted from this document to simulate. Upload a DDR with risk or event evidence.', hi: 'सिम्युलेट करने के लिए इस दस्तावेज़ से कोई जोखिम नहीं निकाला गया। जोखिम या घटना साक्ष्य वाला DDR अपलोड करें।' },
   errWhatif: { en: 'What-if simulation failed.', hi: 'व्हाट-इफ़ सिम्युलेशन विफल।' },
 
@@ -324,6 +325,9 @@ const STR: Dict = {
   wdTaggedMany: { en: '{{count}} depth-tagged events · MD from uploaded report', hi: '{{count}} गहराई-टैग घटनाएँ · अपलोड की गई रिपोर्ट से MD' },
   wdDiveAria: { en: 'Interactive well section to {{depth}} metres', hi: '{{depth}} मीटर तक इंटरैक्टिव कुआँ खंड' },
   wdMetres: { en: '{{depth}} m', hi: '{{depth}} मी' },
+  webglLost: { en: '3D view lost its graphics context.', hi: '3D दृश्य का ग्राफ़िक्स संदर्भ छूट गया।' },
+  webglHint: { en: 'Usually GPU pressure — close heavy tabs, then reload this view.', hi: 'आमतौर पर GPU दबाव — भारी टैब बंद करें, फिर यह दृश्य पुनः लोड करें।' },
+  webglRetry: { en: 'Reload 3D view', hi: '3D दृश्य पुनः लोड करें' },
 }
 
 export type StrKey = keyof typeof STR

@@ -265,13 +265,20 @@ function evaluateTelemetryAlerts(sampleWindow: TelemetrySample[], allSamples: Te
 }
 
 type OCRResult = { text: string; words: Array<{ text: string; bbox: { x0: number; y0: number; x1: number; y1: number } }>; width: number; height: number; engine: string }
+// Read an API JSON body defensively: proxies / dead servers return HTML or empty
+// bodies, and Safari surfaces that as "The string did not match the expected pattern."
+async function readApiJson(response: Response): Promise<any> {
+  let text = ''
+  try { text = await response.text() } catch { throw new L10nError('errApiDown') }
+  try { return JSON.parse(text) } catch { throw new L10nError('errApiDown') }
+}
 async function recognizePage(canvas: HTMLCanvasElement): Promise<OCRResult> {
   const response = await fetch('/api/ocr', {
     method: 'POST', headers: { 'content-type': 'application/json' },
     body: JSON.stringify({ imageBase64: canvas.toDataURL('image/png') }),
     signal: AbortSignal.timeout(660000),
   })
-  const payload = await response.json().catch(() => ({ error: '__L10N__errOcrBad' }))
+  const payload = await readApiJson(response)
   if (!response.ok) {
     if (typeof payload.error === 'string' && payload.error.startsWith('__L10N__')) throw new L10nError(payload.error.slice(8) as StrKey)
     if (payload.error) throw new Error(payload.error)
@@ -339,7 +346,7 @@ async function analyseImage(file: File, onProgress: (progress: number, key: StrK
     if (!text.replace(/\[PAGE \d+\]/g, '').trim()) throw new L10nError('errNoTextImg')
     onProgress(72, 'structuring', { engine: combined.engine })
     const response = await fetch('/api/structure-ddr', { method: 'POST', headers: { 'content-type': 'application/json' }, body: JSON.stringify({ text, words, name: file.name, airgapped: opts.airgapped }) })
-    const payload = await response.json()
+    const payload = await readApiJson(response)
     if (!response.ok) {
       if (typeof payload.error === 'string' && payload.error.startsWith('__L10N__')) throw new L10nError(payload.error.slice(8) as StrKey)
       if (payload.error) throw new Error(payload.error)
@@ -378,7 +385,7 @@ async function analysePdf(file: File, onProgress: (progress: number, key: StrKey
   if (!text.replace(/\[PAGE \d+\]/g, '').trim()) throw new L10nError('errNoTextPdf')
   onProgress(72, 'structuringPdf')
   const response = await fetch('/api/structure-ddr', { method: 'POST', headers: { 'content-type': 'application/json' }, body: JSON.stringify({ text, words, name: file.name, airgapped: opts.airgapped }) })
-  const payload = await response.json()
+  const payload = await readApiJson(response)
   if (!response.ok) {
     if (typeof payload.error === 'string' && payload.error.startsWith('__L10N__')) throw new L10nError(payload.error.slice(8) as StrKey)
     if (payload.error) throw new Error(payload.error)
@@ -832,7 +839,7 @@ function PredictionPanel({ document, question, setQuestion }: { document: Indexe
   const baseMud = parseMudWeight(document.report.mud_weight)
   const whatIfRisks = useMemo(() => computeWhatIfRisks(document.report.risks || [], mudDelta, flowDelta, wobDelta), [document.report.risks, mudDelta, flowDelta, wobDelta])
   const hasWhatIf = mudDelta !== 0 || flowDelta !== 0 || wobDelta !== 0
-  async function ask(event: FormEvent) { event.preventDefault(); if (!question.trim()) return; setAsking(true); setAnswer(''); try { const response = await fetch('/api/ask', { method: 'POST', headers: { 'content-type': 'application/json' }, body: JSON.stringify({ question, corpus: document.corpus, airgapped }) }); const payload = await response.json(); if (!response.ok) throw new Error(payload.error); setAnswer(payload.answer) } catch (error) { setAnswer(error instanceof Error && error.message && !error.message.startsWith('__L10N__') ? error.message : t('errAsk')) } finally { setAsking(false) } }
+  async function ask(event: FormEvent) { event.preventDefault(); if (!question.trim()) return; setAsking(true); setAnswer(''); try { const response = await fetch('/api/ask', { method: 'POST', headers: { 'content-type': 'application/json' }, body: JSON.stringify({ question, corpus: document.corpus, airgapped }) }); const payload = await readApiJson(response); if (!response.ok) throw new Error(payload.error); setAnswer(payload.answer) } catch (error) { setAnswer(error instanceof Error && error.message && !error.message.startsWith('__L10N__') ? error.message : t('errAsk')) } finally { setAsking(false) } }
   async function simulate() {
     if (!document.report.risks.length) { setWhatIfAnswer(t('errWhatifNoRisks')); return }
     setSimulating(true); setWhatIfAnswer('')
@@ -841,7 +848,7 @@ function PredictionPanel({ document, question, setQuestion }: { document: Indexe
     const whatIfQuestion = `WHAT-IF SIMULATION:\nProposed action: ${proposed}\nDeterministic risk scores (transparent rule: loss +18*Δmud+0.18*Δflow, kick -22*Δmud, stuck +12*Δmud-0.12*Δflow+0.14*Δwob, clamped 5-95):\n${table}\n\nTask: Explain which risk(s) increase/decrease, why (mechanism), cite the evidence snippets above, list recommended checks and missing information. Do not invent wells or depths. If evidence is insufficient, say so.`
     try {
       const response = await fetch('/api/ask', { method: 'POST', headers: { 'content-type': 'application/json' }, body: JSON.stringify({ question: whatIfQuestion, corpus: document.corpus, airgapped }) })
-      const payload = await response.json(); if (!response.ok) throw new Error(payload.error); setWhatIfAnswer(payload.answer)
+      const payload = await readApiJson(response); if (!response.ok) throw new Error(payload.error); setWhatIfAnswer(payload.answer)
     } catch (error) { setWhatIfAnswer(error instanceof Error && error.message ? error.message : t('errWhatif')) } finally { setSimulating(false) }
   }
   return <>

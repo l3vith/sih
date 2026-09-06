@@ -1,6 +1,6 @@
 import { useMemo, useState } from 'react'
-import { Canvas } from '@react-three/fiber'
 import { Bounds, Html, Line, OrbitControls } from '@react-three/drei'
+import WebglSafe from './WebglSafe'
 
 type Doc = { name: string; documentVector: number[] | null; embeddingModel: string; report: { well_name: string | null; formation: string | null; events?: { type: string; evidence: string }[]; risks?: { label: string; evidence: string }[] } }
 type Position = [number, number, number]
@@ -53,7 +53,7 @@ export default function DocumentGraph({ documents, activeName, onSelect }: { doc
   return <div className="document-graph">
     <div className="graph-toolbar"><strong>{documents.length} documents · {edges.length} connections</strong><label>Minimum similarity <input aria-label="Minimum similarity" type="range" min="0" max="1" step="0.05" value={threshold} onChange={(event) => setThreshold(Number(event.target.value))} /><output>{threshold.toFixed(2)}</output></label><button onClick={() => setReset((value) => value + 1)}>Reset view</button></div>
     <div className="graph-canvas">
-      <Canvas key={reset} camera={{ position: [14, 10, 18], fov: 45 }} dpr={[1, 1.5]} frameloop="demand">
+      <WebglSafe key={reset} camera={{ position: [14, 10, 18], fov: 45 }} dpr={[1, 1.5]} frameloop="demand">
         <color attach="background" args={['#f1f7f5']} /><ambientLight intensity={1.6} /><directionalLight position={[10, 15, 10]} intensity={2} />
         <Bounds fit clip observe margin={1.5}>
           {edges.map((edge) => <group key={`${edge.a}-${edge.b}`}>
@@ -65,7 +65,7 @@ export default function DocumentGraph({ documents, activeName, onSelect }: { doc
             <Html position={[0, 0.7, 0]} center><button className={`graph-node-label ${index === selectedIndex ? 'selected' : ''}`} onClick={() => onSelect(doc.name)} title={doc.name}>{doc.report.well_name || doc.name}</button></Html>
           </group>)}
         </Bounds><OrbitControls makeDefault />
-      </Canvas>
+      </WebglSafe>
       {hovered && hovered.score >= threshold && <div className="graph-edge-tooltip" role="tooltip">
         <strong>{documents[hovered.a].report.well_name || documents[hovered.a].name} ↔ {documents[hovered.b].report.well_name || documents[hovered.b].name}</strong>
         <b>Similarity {hovered.score.toFixed(2)}</b>
