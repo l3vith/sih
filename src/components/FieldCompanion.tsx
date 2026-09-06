@@ -20,8 +20,14 @@ function Scanner({ onRead, onClose, preferredCamera }: { onRead: (text: string) 
     let busy = false
     const scanner = new QrScanner(video.current!, async result => {
       if (busy) return; busy = true
-      try { await callback.current(result.data); setError('') } catch (e) { setError(String((e as Error).message)) } finally { busy = false }
-    }, { returnDetailedScanResult: true, preferredCamera, highlightScanRegion: true, highlightCodeOutline: true, maxScansPerSecond: 12 })
+      try { await callback.current(result.data); setError('') } catch (e) {
+        const message = String((e as Error).message)
+        if (!/Incomplete QR read|not an NWIS transfer QR/i.test(message)) setError(message)
+      } finally { busy = false }
+    }, { returnDetailedScanResult: true, preferredCamera, highlightScanRegion: true, highlightCodeOutline: true, maxScansPerSecond: 12, calculateScanRegion: video => {
+      const size = Math.round(Math.min(video.videoWidth, video.videoHeight) * 0.9)
+      return { x: Math.round((video.videoWidth - size) / 2), y: Math.round((video.videoHeight - size) / 2), width: size, height: size, downScaledWidth: 800, downScaledHeight: 800 }
+    } })
     const secure = window.isSecureContext || ['localhost', '127.0.0.1'].includes(window.location.hostname)
     if (!secure) { setError('Camera scanning requires HTTPS. Open the deployed NWIS site, or use Import update file.'); return () => scanner.destroy() }
     scanner.start().catch(() => setError('Camera unavailable. Allow camera access in browser settings, then retry.'))

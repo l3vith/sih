@@ -26,21 +26,33 @@ export async function checksum(text: string) {
 export async function framesFor(p: FieldPackage) {
   const bytes = strToU8(JSON.stringify({ ...p, notes: p.notes.map(n => ({ ...n, photos: [] })) }))
   const encoded = bytesToBase64(zlibSync(bytes, { level: 9 }))
+  if (encoded.length <= QR_FRAME_CHARS) return [JSON.stringify({ n: 2, d: encoded })]
   const hash = await checksum(encoded)
-  const count = Math.ceil(encoded.length / QR_FRAME_CHARS)
+  const chunkSize = 300
+  const count = Math.ceil(encoded.length / chunkSize)
   if (count > 500) throw new Error('This batch is too large for QR. Export an update file instead.')
-  return Array.from({ length: count }, (_, i) => JSON.stringify({ nwis: 1, zip: 1, id: p.id, hash, i, count, data: encoded.slice(i * QR_FRAME_CHARS, (i + 1) * QR_FRAME_CHARS) }))
+  return Array.from({ length: count }, (_, i) => JSON.stringify({ n: 2, t: p.id, h: hash, i, c: count, d: encoded.slice(i * chunkSize, (i + 1) * chunkSize) }))
 }
 export class FrameCollector {
   id = ''; hash = ''; count = 0; zip = 0; pieces = new Map<number, string>()
   async add(text: string): Promise<FieldPackage | null> {
     let f: Record<string, unknown>
-    try { f = JSON.parse(text) } catch { throw new Error('The camera saw a partial QR. Keep it steady and centered.') }
-    const zip = f.zip === 1 ? 1 : 0
-    const maxFrameLength = zip ? QR_FRAME_CHARS : 650
-    if (f.nwis !== 1 || (f.zip !== undefined && f.zip !== 1) || typeof f.id !== 'string' || typeof f.hash !== 'string' || !/^[a-f0-9]{64}$/.test(f.hash) || !Number.isInteger(f.count) || (f.count as number) < 1 || (f.count as number) > 500 || !Number.isInteger(f.i) || (f.i as number) < 0 || (f.i as number) >= (f.count as number) || typeof f.data !== 'string' || f.data.length > maxFrameLength) throw new Error('This is not an NWIS transfer QR.')
-    if (this.id && (this.id !== f.id || this.hash !== f.hash || this.count !== f.count || this.zip !== zip)) throw new Error('A different transfer is in progress. Restart scanning to switch.')
-    this.id = f.id; this.hash = f.hash; this.count = f.count as number; this.zip = zip; this.pieces.set(f.i as number, f.data)
+    try { f = JSON.parse(text) } catch { throw new Error('Incomplete QR read.') }
+    if (f.n === 2 && typeof f.d === 'string' && f.c === undefined) {
+      if (f.d.length > QR_FRAME_CHARS) throw new Error('This is not an NWIS transfer QR.')
+      return validatePackage(JSON.parse(strFromU8(unzlibSync(base64ToBytes(f.d)))))
+    }
+    const compact = f.n === 2
+    const id = compact ? f.t : f.id
+    const hash = compact ? f.h : f.hash
+    const count = compact ? f.c : f.count
+    const index = f.i
+    const data = compact ? f.d : f.data
+    const zip = compact || f.zip === 1 ? 1 : 0
+    const maxFrameLength = compact ? 300 : zip ? QR_FRAME_CHARS : 650
+    if ((!compact && f.nwis !== 1) || typeof id !== 'string' || typeof hash !== 'string' || !/^[a-f0-9]{64}$/.test(hash) || !Number.isInteger(count) || (count as number) < 1 || (count as number) > 500 || !Number.isInteger(index) || (index as number) < 0 || (index as number) >= (count as number) || typeof data !== 'string' || data.length > maxFrameLength) throw new Error('This is not an NWIS transfer QR.')
+    if (this.id && (this.id !== id || this.hash !== hash || this.count !== count || this.zip !== zip)) throw new Error('A different transfer is in progress. Restart scanning to switch.')
+    this.id = id; this.hash = hash; this.count = count as number; this.zip = zip; this.pieces.set(index as number, data)
     if (this.pieces.size !== this.count) return null
     const encoded = Array.from({ length: this.count }, (_, i) => this.pieces.get(i)).join('')
     if (await checksum(encoded) !== this.hash) throw new Error('Transfer checksum failed. Restart scanning.')

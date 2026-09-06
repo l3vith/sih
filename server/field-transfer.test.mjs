@@ -8,7 +8,7 @@ const multiPack = { ...pack, notes: [{ ...note, text: noisyText }] }
 test('QR reconstructs Unicode in reverse order and tolerates repeated frames', async () => {
   const frames = await framesFor(multiPack), collector = new FrameCollector()
   assert.ok(frames.length > 1)
-  assert.ok(frames.every(frame => JSON.parse(frame).data.length <= QR_FRAME_CHARS))
+  assert.ok(frames.every(frame => (JSON.parse(frame).d || JSON.parse(frame).data).length <= QR_FRAME_CHARS))
   await collector.add(frames.at(-1)); await collector.add(frames.at(-1))
   let result
   for (const frame of frames.slice().reverse()) result = await collector.add(frame)
@@ -22,7 +22,7 @@ test('mixed transfers and corrupted frames are rejected', async () => {
   const frames = await framesFor(multiPack), other = await framesFor({ ...multiPack, id: 'other' })
   const c = new FrameCollector(); await c.add(frames[0]); await assert.rejects(c.add(other[0]))
   const broken = new FrameCollector()
-  const first = JSON.parse(frames[0]); first.data = 'X' + first.data.slice(1)
+  const first = JSON.parse(frames[0]); first.d = 'X' + first.d.slice(1)
   await broken.add(JSON.stringify(first))
   await assert.rejects(async () => { for (const f of frames.slice(1)) await broken.add(f) }, /checksum/)
 })
