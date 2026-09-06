@@ -2,7 +2,8 @@ import { useEffect, useMemo, useRef, useState } from 'react'
 import { Map as MapLibreMap, NavigationControl, Popup, setWorkerUrl, type StyleSpecification } from 'maplibre-gl'
 import maplibreWorkerUrl from 'maplibre-gl/dist/maplibre-gl-worker.mjs?url'
 import type { FeatureCollection, Point } from 'geojson'
-import { MapPinned } from 'lucide-react'
+import { MapPinned, Maximize2, X } from 'lucide-react'
+import { useLang } from '../lang'
 
 setWorkerUrl(maplibreWorkerUrl)
 
@@ -55,7 +56,9 @@ export default function AllDocumentsMap({ documents, activeName, onSelect }: {
 }) {
   const containerRef = useRef<HTMLDivElement>(null)
   const mapRef = useRef<MapLibreMap | null>(null)
+  const { t } = useLang()
   const [formation, setFormation] = useState('all')
+  const [fullscreen, setFullscreen] = useState(false)
   const formations = useMemo(() => [...new Set(documents.map((doc) => doc.report.formation).filter(Boolean) as string[])], [documents])
   const located = useMemo(() => documents.filter((doc) =>
     Number.isFinite(doc.report.latitude) && Number.isFinite(doc.report.longitude)
@@ -79,6 +82,26 @@ export default function AllDocumentsMap({ documents, activeName, onSelect }: {
 
   const shownRef = useRef(shown)
   shownRef.current = shown
+
+  // fullscreen: lock background scroll, resize map to the fixed viewport, exit on Escape
+  useEffect(() => {
+    if (!fullscreen) return
+    const prev = document.body.style.overflow
+    document.body.style.overflow = 'hidden'
+    const resize = () => mapRef.current?.resize()
+    const frame = requestAnimationFrame(resize)
+    const timer = setTimeout(resize, 120)
+    const onKey = (event: KeyboardEvent) => { if (event.key === 'Escape') setFullscreen(false) }
+    window.addEventListener('keydown', onKey)
+    return () => {
+      document.body.style.overflow = prev
+      cancelAnimationFrame(frame)
+      clearTimeout(timer)
+      window.removeEventListener('keydown', onKey)
+      // let the wrap collapse back first, then fit the map to it
+      requestAnimationFrame(resize)
+    }
+  }, [fullscreen])
 
   useEffect(() => {
     if (!containerRef.current || features.features.length === 0) return
@@ -202,12 +225,13 @@ export default function AllDocumentsMap({ documents, activeName, onSelect }: {
   }, [features, onSelect])
 
   if (!located.length) return <div className="map-missing"><MapPinned size={26} /><b>No uploaded-document coordinates found</b><span>Add latitude and longitude to at least one report.</span></div>
-  return <div className="real-map-wrap all-documents-map">
+  return <div className={`real-map-wrap all-documents-map ${fullscreen ? 'fullscreen' : ''}`}>
     <div ref={containerRef} className="real-map" />
     <div className="map-overlay-title">UPLOADED DOCUMENTS <span>• {shown.length} / {documents.length} LOCATED</span></div>
     <div className="map-control-strip all-documents-controls">
       <div className="strip-well"><b>{located.length} mapped reports</b><small>Orange is selected · hover a well for 3 nearest links · click to open</small></div>
       <label className="strip-group"><span>FORMATION</span><select value={formation} onChange={(event) => setFormation(event.target.value)}><option value="all">All formations</option>{formations.map((name) => <option key={name}>{name}</option>)}</select></label>
+      <button className="strip-icon-btn" aria-label={t('toggleFs')} onClick={() => setFullscreen((v) => !v)}>{fullscreen ? <X size={14} /> : <Maximize2 size={14} />}</button>
     </div>
   </div>
 }
