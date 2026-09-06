@@ -12,7 +12,7 @@ const formatDepth = (depth: number) => depth.toLocaleString()
 export default function WellDive({ report, compact = false, onExpand }: { report: Report; compact?: boolean; onExpand?: () => void }) {
   const { t } = useLang()
   const formations = useMemo(() => report.formations?.length ? report.formations : [{ name: report.formation || t('wdFormationNA'), top_md: 0, bottom_md: report.current_md || 2500 }], [report.formations, report.formation, report.current_md, t])
-  const maxDepth = Math.max(100, report.current_md || Math.max(...formations.map(item => item.bottom_md || 0), 2500))
+  const maxDepth = Math.max(100, report.current_md || 0, ...formations.map(item => item.bottom_md || 0), ...report.events.map(event => event.depth || 0))
   const [visibleDepth, setVisibleDepth] = useState(Math.round(maxDepth * .86))
   const [auto, setAuto] = useState(false)
   const progress = Math.min(1, Math.max(0, visibleDepth / maxDepth))

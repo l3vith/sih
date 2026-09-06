@@ -19,16 +19,20 @@ import LanguageToggle from './components/LanguageToggle'
 import AirgapToggle from './components/AirgapToggle'
 import WellDive from './components/WellDive'
 import AllDocumentsMap from './components/AllDocumentsMap'
+import FieldCompanion from './components/FieldCompanion'
+import { get as getLocal } from 'idb-keyval'
+import type { FieldNote } from './lib/field-transfer'
+import { integrateFieldNotes } from './lib/field-integration'
 import { isSupabaseConfigured, loadDocumentsFromSupabase, saveAlert as saveAlertToSupabase, saveDocumentToSupabase, saveTelemetryBatch, supabase, upsertWellFromReport } from './lib/supabase'
 
 GlobalWorkerOptions.workerSrc = pdfWorkerUrl
 const DocumentGraph = lazy(() => import('./components/DocumentGraph'))
 const SubsurfaceView = lazy(() => import('./components/SubsurfaceView'))
 
-type View = 'command' | 'documents' | 'embeddings' | 'prediction' | 'dive'
+type View = 'command' | 'documents' | 'embeddings' | 'prediction' | 'dive' | 'field'
 type Segment = { page: number; x: number; y: number; w: number; h: number; label: string; tone: 'cyan' | 'amber' | 'coral' }
 type Embedding = { id: string; label: string; excerpt: string; x: number; y: number }
-type Event = { time: string | null; type: string; depth: number | null; severity: 'high' | 'medium' | 'low' | null; mitigation: string | null; evidence: string }
+type Event = { time: string | null; type: string; depth: number | null; severity: 'high' | 'medium' | 'low' | null; mitigation: string | null; evidence: string; field_note_id?: string; source?: 'field'; author?: string; formation?: string | null }
 type Risk = { label: string; probability: number | null; trend: 'rising' | 'steady' | 'falling' | null; evidence: string }
 type OffsetWell = { id: string; latitude: number | null; longitude: number | null; depth: number | null; distance_km: number | null; relationship: string | null }
 type Formation = { name: string; top_md: number | null; bottom_md: number | null }
@@ -40,6 +44,7 @@ type Report = {
   current_md: number | null; current_tvd: number | null; formation: string | null; mud_weight: string | null; operator: string | null;
   rig_name: string | null; lease_block: string | null; progress: number | null; avg_rop: number | null; formations: Formation[];
   events: Event[]; risks: Risk[]; offset_wells: OffsetWell[]; sections: Section[]; trajectory?: SurveyPoint[]; casings?: Casing[];
+  field_observations?: FieldNote[]; field_depth_updated_at?: string; source_current_md?: number | null;
 }
 type Analysis = { report: Report; segments: Segment[]; embeddings: Embedding[]; embeddingModel: string; corpus: string; documentVector: number[] | null }
 type IndexedDocument = Analysis & { name: string; url: string; pages: number }
@@ -99,10 +104,10 @@ function hybridSearch(documents: IndexedDocument[], query: string, filters: { ki
     if (filters.kind === 'all' || filters.kind === 'event') {
       for (const e of doc.report.events) {
         if (filters.severity !== 'all' && (e.severity || 'null') !== filters.severity) continue
-        if (!formationMatch(doc.report.formation)) continue
+        if (!formationMatch(e.source === 'field' ? e.formation || null : doc.report.formation)) continue
         const hay = `${e.type} ${e.evidence} ${e.mitigation || ''} ${String(e.depth || '')}`
         const sc = hasQuery ? scoreText(hay, tokens) : 1
-        if (!hasQuery || sc > 0) out.push({ id: `${doc.name}::event::${e.type}::${e.depth}`, docName: doc.name, wellName: doc.report.well_name, kind: 'event', title: e.type, snippet: e.evidence.slice(0, 120), formation: doc.report.formation, depth: e.depth, severity: e.severity, score: sc + 0.05 })
+        if (!hasQuery || sc > 0) out.push({ id: `${doc.name}::event::${e.field_note_id || e.type}::${e.depth}`, docName: doc.name, wellName: doc.report.well_name, kind: 'event', title: e.type, snippet: e.evidence.slice(0, 120), formation: e.source === 'field' ? e.formation || null : doc.report.formation, depth: e.depth, severity: e.severity, score: sc + 0.05 })
       }
     }
     if (filters.kind === 'all' || filters.kind === 'risk') {
@@ -564,20 +569,38 @@ function FieldMap({ report, fullscreen, onToggleFullscreen }: { report: Report; 
 
 function PdfViewer({ document }: { document: IndexedDocument }) {
   const { t } = useLang()
-  const canvasRef = useRef<HTMLCanvasElement>(null); const [page, setPage] = useState(1)
+  const canvasRef = useRef<HTMLCanvasElement>(null)
+  const [page, setPage] = useState(1), [pages, setPages] = useState(document.pages)
+  const [loading, setLoading] = useState(false), [failure, setFailure] = useState(''), [retry, setRetry] = useState(0)
   const isImage = /\.(png|jpe?g|webp|tiff|bmp)$/i.test(document.name)
+  useEffect(() => { setPage(1); setPages(document.pages); setFailure('') }, [document.name, document.url, document.pages])
   useEffect(() => {
-    if (isImage) return
-    if (!document.url) return
-    let cancelled = false; (async () => { const pdf = await getDocument({ url: document.url }).promise; const current = await pdf.getPage(page); const viewport = current.getViewport({ scale: 1.5 }); const canvas = canvasRef.current; if (!canvas || cancelled) return; const context = canvas.getContext('2d'); if (!context) return; canvas.width = viewport.width; canvas.height = viewport.height; await current.render({ canvas, canvasContext: context, viewport }).promise })().catch(() => undefined); return () => { cancelled = true }
-  }, [document.url, page, isImage])
-  const segments = document.segments.filter((segment) => segment.page === page)
-  const missingSource = !document.url
-  if (missingSource) {
-    return <div className="pdf-canvas-shell"><div className="pdf-page" style={{ display: 'grid', placeItems: 'center', padding: 24, textAlign: 'center', gap: 8 }}><FileScan size={28} color="#9aa8a5" /><b style={{ color: '#314a47', fontSize: 11 }}>{t('docIntel')}</b><span style={{ color: '#7e8a88', fontSize: 10, maxWidth: 260 }}>{document.name} — source PDF not in Storage (uploaded before storage was enabled). Re-upload the file to view it.</span></div></div>
-  }
-  if (isImage) return <div className="pdf-canvas-shell"><div className="pdf-page-controls"><span>{t('pageImage')}</span></div><div className="pdf-page" style={{ display: 'grid', placeItems: 'center', overflow: 'auto' }}><img src={document.url} alt={document.name} style={{ maxWidth: '100%', maxHeight: '100%', objectFit: 'contain' }} />{segments.map((segment, index) => <div key={`${segment.label}-${index}`} className={`seg-box ${segment.tone} visible`} style={{ left: `${segment.x}%`, top: `${segment.y}%`, width: `${segment.w}%`, height: `${segment.h}%` }}><span>{segment.label}</span></div>)}</div></div>
-  return <div className="pdf-canvas-shell"><div className="pdf-page-controls"><button disabled={page === 1} onClick={() => setPage((current) => current - 1)}>{t('prev')}</button><span>{t('pageOf', { p: page, n: document.pages })}</span><button disabled={page === document.pages} onClick={() => setPage((current) => current + 1)}>{t('next')}</button></div><div className="pdf-page"><canvas ref={canvasRef} />{segments.map((segment, index) => <div key={`${segment.label}-${index}`} className={`seg-box ${segment.tone} visible`} style={{ left: `${segment.x}%`, top: `${segment.y}%`, width: `${segment.w}%`, height: `${segment.h}%` }}><span>{segment.label}</span></div>)}</div></div>
+    if (isImage || !document.url) return
+    let cancelled = false
+    let render: { cancel: () => void; promise: Promise<void> } | undefined
+    const task = getDocument({ url: document.url })
+    setLoading(true); setFailure('')
+    ;(async () => {
+      const pdf = await task.promise
+      if (cancelled) return
+      setPages(pdf.numPages)
+      if (page > pdf.numPages) { setPage(1); return }
+      const current = await pdf.getPage(page)
+      if (cancelled || !canvasRef.current) return
+      const canvas = canvasRef.current, context = canvas.getContext('2d')
+      if (!context) throw new Error('The browser could not create a PDF canvas.')
+      const viewport = current.getViewport({ scale: 1.5 })
+      canvas.width = viewport.width; canvas.height = viewport.height
+      render = current.render({ canvas, canvasContext: context, viewport })
+      await render.promise
+      if (!cancelled) setLoading(false)
+    })().catch(error => { if (!cancelled) { setFailure(error instanceof Error ? error.message : 'Could not render this PDF.'); setLoading(false) } })
+    return () => { cancelled = true; render?.cancel(); void task.destroy() }
+  }, [document.url, page, isImage, retry])
+  const segments = document.segments.filter(segment => segment.page === page)
+  if (!document.url) return <div className="pdf-viewer-status" role="status"><FileScan size={24} /><strong>Source document unavailable</strong><p>{document.name}</p><p>The report data is available, but its source file has not loaded from storage. If this persists, re-upload the original file.</p></div>
+  if (isImage) return <div className="pdf-canvas-shell"><div className="pdf-page-controls"><span>{t('pageImage')}</span></div><div className="pdf-page"><img src={document.url} alt={document.name} style={{ width: '100%', display: 'block' }} />{segments.map((segment, index) => <div key={index} className={`seg-box ${segment.tone} visible`} style={{ left: `${segment.x}%`, top: `${segment.y}%`, width: `${segment.w}%`, height: `${segment.h}%` }}><span>{segment.label}</span></div>)}</div></div>
+  return <div className="pdf-canvas-shell"><div className="pdf-page-controls"><button disabled={page === 1 || loading} onClick={() => setPage(p => p - 1)}>{t('prev')}</button><span>{t('pageOf', { p: page, n: pages })}</span><button disabled={page >= pages || loading} onClick={() => setPage(p => p + 1)}>{t('next')}</button></div>{loading && <div className="pdf-viewer-status" role="status"><LoaderCircle className="ocr-spinner" size={20} />Loading PDF…</div>}{failure && <div className="pdf-viewer-status" role="alert"><strong>PDF could not be displayed</strong><p>{failure}</p><button onClick={() => setRetry(r => r + 1)}>Retry PDF</button></div>}<div className="pdf-page" style={{ display: loading || failure ? 'none' : undefined }}><canvas ref={canvasRef} />{!loading && !failure && segments.map((segment, index) => <div key={index} className={`seg-box ${segment.tone} visible`} style={{ left: `${segment.x}%`, top: `${segment.y}%`, width: `${segment.w}%`, height: `${segment.h}%` }}><span>{segment.label}</span></div>)}</div></div>
 }
 
 function PanelHeader({ icon, title, meta }: { icon: ReactNode; title: string; meta?: string }) { return <div className="panel-header"><span className="panel-title"><i>{icon}</i>{title}</span>{meta && <span className="panel-meta">{meta}</span>}</div> }
@@ -592,6 +615,7 @@ function DepthPanel({ report, onOpenDive }: { report: Report; onOpenDive?: () =>
   return <>
     <PanelHeader icon={<Activity size={16} />} title={t('activeWell')} meta={report.well_name || t('nameNotFound')} />
     <div className="active-depth"><span>{t('measuredDepth')}</span><strong>{value(report.current_md, um, nf)}</strong><b>{report.formation || t('formationNotFound')}</b></div>
+    {report.field_depth_updated_at && <p className="field-data-source">Field reading · {new Date(report.field_depth_updated_at).toLocaleString()}<br />Source report: {value(report.source_current_md, um, nf)}</p>}
     <div className="extracted-metrics"><span><small>{t('tvd')}</small><b>{value(report.current_tvd, um, nf)}</b></span><span><small>{t('progressLbl')}</small><b>{value(report.progress, um, nf)}</b></span><span><small>{t('avgRop')}</small><b>{value(report.avg_rop, t('unitRop'), nf)}</b></span><span><small>{t('mudWeight')}</small><b>{value(report.mud_weight, '', nf)}</b></span></div>
     <div className="formation-list">{formations.length ? formations.map((formation, index) => <div key={`${formation.name}-${index}`}><strong>{formation.name}</strong><span>{formation.top_md === null && formation.bottom_md === null ? t('depthIntervalNA') : `${value(formation.top_md, um, nf)} – ${value(formation.bottom_md, um, nf)}`}</span></div>) : <p>{t('noFormations')}</p>}</div>
     {onOpenDive && <button className="coral-action" onClick={onOpenDive} style={{ margin: '0 14px 14px' }}><Waves size={14} /> {t('openDive')}</button>}
@@ -614,8 +638,9 @@ function StreamPanel({ document, status }: { document: IndexedDocument; status: 
   const eventItems = document.report.events.map((event) => ({
     title: event.type,
     detail: `${event.time ? event.time + ' · ' : ''}${event.depth === null ? t('depthNA') : `${event.depth.toLocaleString()}${um}`} · ${event.evidence} ${event.severity ? `· ${event.severity}` : ''}`,
-    icon: <AlertTriangle size={15} />,
-    tone: 'amber',
+    icon: event.source === 'field' ? <FileText size={15} /> : <AlertTriangle size={15} />,
+    tone: event.source === 'field' ? 'cyan' : 'amber',
+    observedAt: event.source === 'field' ? event.time : null,
   }))
   const riskItems = document.report.risks.map((risk) => ({
     title: risk.label,
@@ -631,12 +656,12 @@ function StreamPanel({ document, status }: { document: IndexedDocument; status: 
   }))
   const items = [
     { title: t('pdfOcr'), detail: status, icon: <FileText size={15} />, tone: 'cyan' },
-    ...sectionItems,
     ...eventItems,
+    ...sectionItems,
     ...riskItems,
     ...offsetItems,
   ]
-  return <><PanelHeader icon={<Zap size={16} />} title={t('liveStream')} meta={t('itemsPipe', { count: items.length })} /><div className="stream-list" style={{ maxHeight: 420, overflowY: 'auto' }}>{items.map((item, index) => <div className="stream-item" key={`${item.title}-${index}`}><time>{t('now')}</time><span className={`stream-icon ${item.tone}`}>{item.icon}</span><div><strong>{item.title}</strong><span>{item.detail}</span></div><ArrowUpRight size={13} /></div>)}</div></>
+  return <><PanelHeader icon={<Zap size={16} />} title={t('liveStream')} meta={t('itemsPipe', { count: items.length })} /><div className="stream-list" style={{ maxHeight: 420, overflowY: 'auto' }}>{items.map((item, index) => <div className="stream-item" key={`${item.title}-${index}`}><time>{'observedAt' in item && typeof item.observedAt === 'string' && item.observedAt ? new Date(item.observedAt).toLocaleDateString() : t('now')}</time><span className={`stream-icon ${item.tone}`}>{item.icon}</span><div><strong>{item.title}</strong><span title={item.detail}>{item.detail}</span></div><ArrowUpRight size={13} /></div>)}</div></>
 }
 
 function RiskRow({ risks, events, openPrediction }: { risks: Risk[]; events: Event[]; openPrediction: () => void }) {
@@ -841,7 +866,10 @@ function PredictionPanel({ document, question, setQuestion }: { document: Indexe
   const baseMud = parseMudWeight(document.report.mud_weight)
   const whatIfRisks = useMemo(() => computeWhatIfRisks(document.report.risks || [], mudDelta, flowDelta, wobDelta), [document.report.risks, mudDelta, flowDelta, wobDelta])
   const hasWhatIf = mudDelta !== 0 || flowDelta !== 0 || wobDelta !== 0
-  async function ask(event: FormEvent) { event.preventDefault(); if (!question.trim()) return; setAsking(true); setAnswer(''); try { const response = await fetch('/api/ask', { method: 'POST', headers: { 'content-type': 'application/json' }, body: JSON.stringify({ question, corpus: document.corpus, airgapped }) }); const payload = await readApiJson(response); if (!response.ok) throw new Error(payload.error); setAnswer(payload.answer) } catch (error) { setAnswer(error instanceof Error && error.message && !error.message.startsWith('__L10N__') ? error.message : t('errAsk')) } finally { setAsking(false) } }
+  async function evidenceWithFieldNotes() {
+    return document.corpus
+  }
+  async function ask(event: FormEvent) { event.preventDefault(); if (!question.trim()) return; setAsking(true); setAnswer(''); try { const response = await fetch('/api/ask', { method: 'POST', headers: { 'content-type': 'application/json' }, body: JSON.stringify({ question, corpus: await evidenceWithFieldNotes(), airgapped }) }); const payload = await readApiJson(response); if (!response.ok) throw new Error(payload.error); setAnswer(payload.answer) } catch (error) { setAnswer(error instanceof Error && error.message && !error.message.startsWith('__L10N__') ? error.message : t('errAsk')) } finally { setAsking(false) } }
   async function simulate() {
     if (!document.report.risks.length) { setWhatIfAnswer(t('errWhatifNoRisks')); return }
     setSimulating(true); setWhatIfAnswer('')
@@ -849,7 +877,7 @@ function PredictionPanel({ document, question, setQuestion }: { document: Indexe
     const proposed = `Mud weight Δ ${mudDelta > 0 ? '+' : ''}${mudDelta.toFixed(2)} ppg (base ${baseMud !== null ? baseMud + ' ppg' : document.report.mud_weight || 'not stated'}), Flow Δ ${flowDelta > 0 ? '+' : ''}${flowDelta}% , WOB Δ ${wobDelta > 0 ? '+' : ''}${wobDelta}% at ${value(document.report.current_md, ' m')} in ${document.report.formation || 'formation not stated'}.`
     const whatIfQuestion = `WHAT-IF SIMULATION:\nProposed action: ${proposed}\nDeterministic risk scores (transparent rule: loss +18*Δmud+0.18*Δflow, kick -22*Δmud, stuck +12*Δmud-0.12*Δflow+0.14*Δwob, clamped 5-95):\n${table}\n\nTask: Explain which risk(s) increase/decrease, why (mechanism), cite the evidence snippets above, list recommended checks and missing information. Do not invent wells or depths. If evidence is insufficient, say so.`
     try {
-      const response = await fetch('/api/ask', { method: 'POST', headers: { 'content-type': 'application/json' }, body: JSON.stringify({ question: whatIfQuestion, corpus: document.corpus, airgapped }) })
+      const response = await fetch('/api/ask', { method: 'POST', headers: { 'content-type': 'application/json' }, body: JSON.stringify({ question: whatIfQuestion, corpus: await evidenceWithFieldNotes(), airgapped }) })
       const payload = await readApiJson(response); if (!response.ok) throw new Error(payload.error); setWhatIfAnswer(payload.answer)
     } catch (error) { setWhatIfAnswer(error instanceof Error && error.message ? error.message : t('errWhatif')) } finally { setSimulating(false) }
   }
@@ -886,10 +914,13 @@ function PredictionPanel({ document, question, setQuestion }: { document: Indexe
 export default function App() {
   const { t, airgapped } = useLang()
   const um = t('unitM'); const nf = t('notFound')
-  const [view, setView] = useState<View>('command'); const [sidebarOpen, setSidebarOpen] = useState(true); const [documents, setDocuments] = useState<IndexedDocument[]>([]); const [activeName, setActiveName] = useState<string | null>(null); const [processing, setProcessing] = useState(false); const [progress, setProgress] = useState(0); const [statusKey, setStatusKey] = useState<StrKey>('statusInit'); const [statusVars, setStatusVars] = useState<Record<string, string | number>>({}); const status = t(statusKey, statusVars); const [error, setError] = useState(''); const [question, setQuestion] = useState(''); const [dragOver, setDragOver] = useState(false); const [fullscreen, setFullscreen] = useState(false)
+  const [view, setView] = useState<View>('command'); const [sidebarOpen, setSidebarOpen] = useState(true); const [sourceDocuments, setDocuments] = useState<IndexedDocument[]>([]); const [activeName, setActiveName] = useState<string | null>(null); const [processing, setProcessing] = useState(false); const [progress, setProgress] = useState(0); const [statusKey, setStatusKey] = useState<StrKey>('statusInit'); const [statusVars, setStatusVars] = useState<Record<string, string | number>>({}); const status = t(statusKey, statusVars); const [error, setError] = useState(''); const [question, setQuestion] = useState(''); const [dragOver, setDragOver] = useState(false); const [fullscreen, setFullscreen] = useState(false)
   const [searchQuery, setSearchQuery] = useState(''); const [searchKind, setSearchKind] = useState<SearchKind>('all'); const [searchFormation, setSearchFormation] = useState('all'); const [searchSeverity, setSearchSeverity] = useState('all'); const [searchOpen, setSearchOpen] = useState(false)
   const searchRef = useRef<HTMLDivElement>(null)
-  const searchFormationOptions = useMemo(() => { const s = new Set<string>(); for (const d of documents) { if (d.report.formation) s.add(d.report.formation); for (const f of d.report.formations || []) if (f.name) s.add(f.name) } return [...s] }, [documents])
+  const [fieldNotes, setFieldNotes] = useState<FieldNote[]>([])
+  useEffect(() => { getLocal<FieldNote[]>('nwis-field-imports-v1').then(notes => setFieldNotes(notes || [])).catch(() => setError('Could not restore field updates from local storage.')) }, [])
+  const documents = useMemo(() => integrateFieldNotes(sourceDocuments, fieldNotes), [sourceDocuments, fieldNotes])
+  const searchFormationOptions = useMemo(() => { const s = new Set<string>(); for (const d of documents) { if (d.report.formation) s.add(d.report.formation); for (const e of d.report.events) if (e.formation) s.add(e.formation); for (const f of d.report.formations || []) if (f.name) s.add(f.name) } return [...s] }, [documents])
   const searchResults = useMemo(() => documents.length ? hybridSearch(documents, searchQuery, { kind: searchKind, formation: searchFormation, severity: searchSeverity }) : [], [documents, searchQuery, searchKind, searchFormation, searchSeverity])
   useEffect(() => {
     function onDocClick(e: MouseEvent) { if (searchRef.current && !searchRef.current.contains(e.target as Node)) setSearchOpen(false) }
@@ -921,13 +952,10 @@ export default function App() {
           documentVector: (d.document_vector as unknown as number[] | null) ?? (d.document_vector_json as unknown as number[] | null) ?? null,
         }))
         // only restore if local is empty to avoid overwriting fresh ingest
-        let didRestore = false
         setDocuments(prev => {
           if (prev.length !== 0) return prev
-          didRestore = true
           return restored
         })
-        if (!didRestore) return
         setActiveName(prev => prev ?? restored[0]?.name ?? null)
         if (restored.length) { setStatusKey('statusRestored'); setStatusVars({ count: restored.length }) }
         // lazy fetch PDFs from private bucket (download -> blob URL)
@@ -938,9 +966,10 @@ export default function App() {
               // fallback: signed URL for pdfjs
               const { data: signed, error: signErr } = await sb.storage.from('documents').createSignedUrl(doc.name, 3600)
               if (!signErr && signed?.signedUrl) {
+                if (documentUrlMapRef.current.has(doc.name)) continue
                 const url = signed.signedUrl
                 documentUrlMapRef.current.set(doc.name, url)
-                setDocuments(prev => prev.map(p => p.name === doc.name ? { ...p, url } : p))
+                setDocuments(prev => prev.map(p => p.name === doc.name && !p.url ? { ...p, url } : p))
               } else {
                 console.warn('[supabase storage] download failed', doc.name, dlErr?.message ?? signErr?.message)
               }
@@ -948,9 +977,9 @@ export default function App() {
             }
             const url = URL.createObjectURL(blob)
             const prevUrl = documentUrlMapRef.current.get(doc.name)
-            if (prevUrl && prevUrl.startsWith('blob:')) URL.revokeObjectURL(prevUrl)
+            if (prevUrl) { URL.revokeObjectURL(url); continue }
             documentUrlMapRef.current.set(doc.name, url)
-            setDocuments(prev => prev.map(p => p.name === doc.name ? { ...p, url } : p))
+            setDocuments(prev => prev.map(p => p.name === doc.name && !p.url ? { ...p, url } : p))
           } catch (e) { console.warn('[supabase storage] restore fetch', doc.name, e) }
         }
       } catch (e) { console.warn('[supabase] restore failed', e) }
@@ -1007,8 +1036,9 @@ export default function App() {
     } finally { ingestingRef.current = false; setProcessing(false) }
   }
   const report = document?.report
-  const navItems: [View, ReactNode, string][] = [['command', <Crosshair size={17} />, t('navCommand')], ['dive', <Waves size={17} />, t('navDive')], ['documents', <FileScan size={17} />, t('navDocs')], ['embeddings', <Network size={17} />, t('navEmbed')], ['prediction', <BrainCircuit size={17} />, t('navPredict')]]
+  const navItems: [View, ReactNode, string][] = [['command', <Crosshair size={17} />, t('navCommand')], ['dive', <Waves size={17} />, t('navDive')], ['documents', <FileScan size={17} />, t('navDocs')], ['embeddings', <Network size={17} />, t('navEmbed')], ['prediction', <BrainCircuit size={17} />, t('navPredict')], ['field', <FileText size={17} />, 'Field updates']]
   function renderView() {
+    if (view === 'field') return <FieldCompanion receiver wells={documents.map(d => d.report.well_name || d.name)} reports={sourceDocuments.map(d => ({ well: d.report.well_name || d.name, depth: d.report.current_md, formations: d.report.formations || [] }))} onApplied={setFieldNotes} />
     if (documents.length === 0) return processing ? null : <EmptyWorkspace view={view} />
     if (!document || !report) return <EmptyWorkspace view={view} />
     if (view === 'documents') return <div className="view-grid documents-view"><div className="panel document-panel"><DocumentPanel document={document} processing={processing} progress={progress} status={status} /></div><div className="panel activity-panel"><StreamPanel document={document} status={status} /></div></div>
@@ -1018,7 +1048,7 @@ export default function App() {
     const locatedDocuments = documents.filter((doc) => Number.isFinite(doc.report.latitude) && Number.isFinite(doc.report.longitude)).length
     return <><div className="hero-grid"><div className="panel map-panel"><PanelHeader icon={<MapPinned size={16} />} title={t('docWellLoc')} meta={`${locatedDocuments} / ${documents.length} · ${t('mapped', { count: locatedDocuments })}`} /><AllDocumentsMap documents={documents} activeName={document.name} onSelect={setActiveName} /></div><div className="panel depth-panel"><DepthPanel report={report} onOpenDive={() => setView('dive')} /></div><div className="panel document-panel"><DocumentPanel document={document} processing={processing} progress={progress} status={status} /></div></div><section className="panel subsurface-panel"><PanelHeader icon={<Waves size={16} />} title="SUBSURFACE 3D" meta={`${report.well_name || document.name} · VIDEX 3D`} /><Suspense fallback={<div className="subsurface-loading"><LoaderCircle className="ocr-spinner" size={22} /> Loading subsurface renderer…</div>}><SubsurfaceView report={report} /></Suspense></section><RiskRow risks={report.risks || []} events={report.events || []} openPrediction={() => setView('prediction')} /><TelemetryPanel report={report} /><div className="lower-grid"><div className="panel activity-panel"><StreamPanel document={document} status={status} /></div><div className="panel prediction-panel"><PredictionPanel document={document} question={question} setQuestion={setQuestion} /></div></div></>
   }
-  const heading = view === 'command' ? t('headCommand') : view === 'dive' ? t('headDive') : view === 'documents' ? t('headDocs') : view === 'embeddings' ? t('headEmbed') : t('headPredict')
+  const heading = view === 'field' ? 'Observations from the field.' : view === 'command' ? t('headCommand') : view === 'dive' ? t('headDive') : view === 'documents' ? t('headDocs') : view === 'embeddings' ? t('headEmbed') : t('headPredict')
   function onDragOver(event: React.DragEvent) { event.preventDefault(); if (!dragOver) setDragOver(true) }
   function onDragLeave(event: React.DragEvent) { if (!(event.currentTarget as HTMLElement).contains(event.relatedTarget as Node)) setDragOver(false) }
   async function onDrop(event: React.DragEvent) { event.preventDefault(); setDragOver(false); const files = event.dataTransfer.files; if (files && files.length) await ingestFiles(files) }
