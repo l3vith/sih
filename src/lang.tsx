@@ -28,6 +28,12 @@ const STR: Dict = {
   language: { en: 'Language', hi: 'भाषा' },
   switchToHi: { en: 'Switch to Hindi', hi: 'हिंदी में बदलें' },
   switchToEn: { en: 'Switch to English', hi: 'अंग्रेज़ी में बदलें' },
+  airgap: { en: 'AIRGAP', hi: 'एयरगैप' },
+  airgapOn: { en: 'Enable airgapped mode — fully offline, local Osaurus LLM only', hi: 'एयरगैप मोड चालू करें — पूर्णतः ऑफ़लाइन, केवल स्थानीय Osaurus LLM' },
+  airgapOff: { en: 'Disable airgapped mode — allow cloud LLM and sync', hi: 'एयरगैप मोड बंद करें — क्लाउड LLM और सिंक की अनुमति दें' },
+  airgapped: { en: 'AIRGAPPED', hi: 'एयरगैप्ड' },
+  airgapActive: { en: 'AIRGAPPED · LOCAL ONLY', hi: 'एयरगैप्ड · केवल स्थानीय' },
+  errAirgapOsaurus: { en: 'Airgapped mode: local LLM is unreachable. Start the Osaurus runtime and retry.', hi: 'एयरगैप मोड: स्थानीय LLM उपलब्ध नहीं। Osaurus रनटाइम शुरू करके पुनः प्रयास करें।' },
 
   // Search filter dropdowns
   fAll: { en: 'All', hi: 'सभी' },
@@ -322,10 +328,12 @@ const STR: Dict = {
 
 export type StrKey = keyof typeof STR
 
-const ctx = createContext<{ lang: Lang; setLang: (l: Lang) => void; t: (key: StrKey, vars?: Record<string, string | number>) => string }>({
+const ctx = createContext<{ lang: Lang; setLang: (l: Lang) => void; t: (key: StrKey, vars?: Record<string, string | number>) => string; airgapped: boolean; setAirgapped: (v: boolean) => void }>({
   lang: 'en',
   setLang: () => undefined,
   t: (key) => STR[key]?.en ?? key,
+  airgapped: false,
+  setAirgapped: () => undefined,
 })
 
 function initialLang(): Lang {
@@ -337,11 +345,21 @@ function initialLang(): Lang {
   return 'en'
 }
 
+function initialAirgapped(): boolean {
+  try { return localStorage.getItem('nwis-airgap') === '1' } catch { /* */ }
+  return false
+}
+
 export function LanguageProvider({ children }: { children: ReactNode }) {
   const [lang, setLangState] = useState<Lang>(initialLang)
   const setLang = useCallback((l: Lang) => {
     setLangState(l)
     try { localStorage.setItem('nwis-lang', l) } catch { /* */ }
+  }, [])
+  const [airgapped, setAirgappedState] = useState<boolean>(initialAirgapped)
+  const setAirgapped = useCallback((v: boolean) => {
+    setAirgappedState(v)
+    try { localStorage.setItem('nwis-airgap', v ? '1' : '0') } catch { /* */ }
   }, [])
   useEffect(() => {
     document.documentElement.lang = lang
@@ -353,7 +371,7 @@ export function LanguageProvider({ children }: { children: ReactNode }) {
     if (vars) for (const [k, v] of Object.entries(vars)) s = s.split(`{{${k}}}`).join(String(v))
     return s
   }, [lang])
-  const value = useMemo(() => ({ lang, setLang, t }), [lang, setLang, t])
+  const value = useMemo(() => ({ lang, setLang, t, airgapped, setAirgapped }), [lang, setLang, t, airgapped, setAirgapped])
   return <ctx.Provider value={value}>{children}</ctx.Provider>
 }
 

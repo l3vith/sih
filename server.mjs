@@ -80,6 +80,21 @@ async function osaurusChat({ messages, temperature = 0.05, max_tokens = 1200, re
   if (!content) throw new Error('Osaurus returned empty content')
   return content
 }
+// Airgapped mode: client opts out of every cloud call (Google/Groq/Supabase).
+// Only loopback services are used: local MLX OCR, local Osaurus LLM, local embeddings.
+const isAirgapped = (req) => req.body?.airgapped === true || req.headers['x-airgapped'] === '1'
+const OSAURUS_DOWN = 'Airgapped mode: the local Osaurus LLM is unreachable. Start it (default http://127.0.0.1:1337) and retry.'
+async function checkOsaurus() {
+  try {
+    const r = await fetch(`${osaurusUrl}/models`, { signal: AbortSignal.timeout(2000) })
+    if (r.ok) return true
+  } catch {}
+  try {
+    const r = await fetch(`${osaurusUrl}/tags`, { signal: AbortSignal.timeout(2000) })
+    if (r.ok) return true
+  } catch {}
+  return false
+}
 const clean = (value) => String(value || '').toLowerCase().replace(/[^a-z0-9]+/g, ' ').trim()
 
 function jsonFrom(value) {
@@ -309,7 +324,7 @@ async function textEmbeddings(text, sections) {
   }
 }
 
-app.get('/api/health', (_req, res) => res.json({ ready: Boolean(groq), model, embeddingModel, embeddingsReady: true, googleModel, osaurusModel: osaurusModelEnv, supabase: Boolean(supabase) }))
+app.get('/api/health', async (_req, res) => res.json({ ready: Boolean(groq), model, embeddingModel, embeddingsReady: true, googleModel, osaurusModel: osaurusModelEnv, osaurusReachable: await checkOsaurus(), supabase: Boolean(supabase) }))
 app.get('/api/supabase/health', (_req, res) => res.json({ configured: Boolean(supabase), url: supabaseUrl ? supabaseUrl.slice(0, 28) + '...' : null }))
 // Proxy for documents when RLS blocks anon — uses service key
 app.get('/api/supabase/documents', async (_req, res) => {
@@ -322,7 +337,8 @@ app.get('/api/supabase/documents', async (_req, res) => {
 installMlxOcr(app)
 
 app.post('/api/structure-ddr', async (req, res) => {
-  if (!groq) return res.status(503).json({ error: 'GROQ_API_KEY is not configured.' })
+  const airgapped = isAirgapped(req)
+  if (!groq && !airgapped) return res.status(503).json({ error: 'GROQ_API_KEY is not configured.' })
   const text = String(req.body?.text || '').slice(0, 12000)
   const words = Array.isArray(req.body?.words) ? req.body.words.slice(0, 8000) : []
   if (!text.trim()) return res.status(400).json({ error: 'No OCR text supplied.' })
@@ -340,7 +356,17 @@ The OCR layout detector found these top-level headings: ${JSON.stringify(heading
 sections MUST contain exactly one entry for every heading in that list, in document order. anchor must exactly copy that heading. label may normalize capitalization but not meaning. evidence must be a concise verbatim excerpt from that section.
 OCR TEXT:\n${text}` },
     ]
-    try {
+    if (airgapped) {
+      // Airgapped mode: local Osaurus LLM only — Google/Groq are never contacted.
+      try {
+        const osaurusContent = await osaurusChat({ messages: structureMessages, temperature: 0.05, max_tokens: 1500 })
+        report = jsonFrom(osaurusContent)
+        console.log('[structure-ddr] Osaurus (airgapped) succeeded')
+      } catch (osaurusErr) {
+        console.warn('[structure-ddr] Osaurus (airgapped) failed:', osaurusErr instanceof Error ? osaurusErr.message.slice(0, 300) : String(osaurusErr).slice(0, 300))
+        return res.status(503).json({ error: OSAURUS_DOWN })
+      }
+    } else try {
       // FIRST TRY: Google GenAI (gemma-4-26b-a4b-it) – has vision, best for handwritten
       const googleContent = await googleChat({ messages: structureMessages, temperature: 0.05, max_tokens: 1800 })
       report = jsonFrom(googleContent)
@@ -390,8 +416,9 @@ OCR TEXT:\n${text}` },
     }
     const embeddings = await textEmbeddings(text, sections)
     const documentVector = await getDocumentVector(report, text)
-    // best-effort Supabase persistence (well + document) — client also persists with file name; server keeps well registry
-    if (supabase) {
+    // best-effort Supabase persistence (well + document) — client also persists with file name; server keeps well registry.
+    // Skipped in airgap mode: no network egress beyond loopback services.
+    if (supabase && !airgapped) {
       try {
         if (report?.well_name) {
           await supabase.from('wells').upsert({
@@ -423,7 +450,8 @@ OCR TEXT:\n${text}` },
 })
 
 app.post('/api/ask', async (req, res) => {
-  if (!groq) return res.status(503).json({ error: 'GROQ_API_KEY is not configured.' })
+  const airgapped = isAirgapped(req)
+  if (!groq && !airgapped) return res.status(503).json({ error: 'GROQ_API_KEY is not configured.' })
   const question = String(req.body?.question || '').slice(0, 3000)
   const corpus = String(req.body?.corpus || '').slice(0, 50000)
   if (!question || !corpus) return res.status(400).json({ error: 'Question and indexed document context are required.' })
@@ -431,6 +459,18 @@ app.post('/api/ask', async (req, res) => {
     { role: 'system', content: 'You are NWIS drilling decision support. Answer only from uploaded-document evidence. If evidence is insufficient, say so. Include Evidence and Recommended check sections. Never invent wells, depths, events, or probabilities.' },
     { role: 'user', content: `UPLOADED DOCUMENT CONTEXT:\n${corpus}\n\nENGINEER QUESTION:\n${question}` },
   ]
+  if (airgapped) {
+    // Airgapped mode: local Osaurus LLM only — Google/Groq are never contacted.
+    try {
+      const answer = await osaurusChat({ messages: askMessages, temperature: 0.1, max_tokens: 800 })
+      console.log('[ask] Osaurus (airgapped) succeeded')
+      res.json({ answer })
+    } catch (osaurusErr) {
+      console.warn('[ask] Osaurus (airgapped) failed:', osaurusErr instanceof Error ? osaurusErr.message.slice(0, 300) : String(osaurusErr).slice(0, 300))
+      res.status(503).json({ error: OSAURUS_DOWN })
+    }
+    return
+  }
   try {
     // FIRST TRY: Google (gemma-4-26b-a4b-it) – best for handwritten + vision
     try {

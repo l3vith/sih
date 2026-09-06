@@ -14,6 +14,7 @@ import { Activity, AlertTriangle, Anchor, ArrowUpRight, Bell, BrainCircuit, Chev
 import { enText, useLang } from './lang'
 import type { StrKey } from './lang'
 import LanguageToggle from './components/LanguageToggle'
+import AirgapToggle from './components/AirgapToggle'
 import WellDive from './components/WellDive'
 import AllDocumentsMap from './components/AllDocumentsMap'
 import { isSupabaseConfigured, loadDocumentsFromSupabase, saveAlert as saveAlertToSupabase, saveDocumentToSupabase, saveTelemetryBatch, supabase, upsertWellFromReport } from './lib/supabase'
@@ -316,7 +317,7 @@ function cosine(a: number[], b: number[]) {
   return dot / (Math.sqrt(na) * Math.sqrt(nb) || 1)
 }
 
-async function analyseImage(file: File, onProgress: (progress: number, key: StrKey, vars?: Record<string, string | number>) => void): Promise<{ analysis: Analysis; pages: number }> {
+async function analyseImage(file: File, onProgress: (progress: number, key: StrKey, vars?: Record<string, string | number>) => void, opts: { airgapped: boolean }): Promise<{ analysis: Analysis; pages: number }> {
   onProgress(25, 'pgReadingImg')
   const imageUrl = URL.createObjectURL(file)
   try {
@@ -337,7 +338,7 @@ async function analyseImage(file: File, onProgress: (progress: number, key: StrK
     const words: WordBox[] = (combined.words || []).map((word) => ({ text: word.text, page: 1, x: word.bbox.x0 / combined.width * 100, y: word.bbox.y0 / combined.height * 100, w: (word.bbox.x1 - word.bbox.x0) / combined.width * 100, h: (word.bbox.y1 - word.bbox.y0) / combined.height * 100, fromOcr: true }))
     if (!text.replace(/\[PAGE \d+\]/g, '').trim()) throw new L10nError('errNoTextImg')
     onProgress(72, 'structuring', { engine: combined.engine })
-    const response = await fetch('/api/structure-ddr', { method: 'POST', headers: { 'content-type': 'application/json' }, body: JSON.stringify({ text, words, name: file.name }) })
+    const response = await fetch('/api/structure-ddr', { method: 'POST', headers: { 'content-type': 'application/json' }, body: JSON.stringify({ text, words, name: file.name, airgapped: opts.airgapped }) })
     const payload = await response.json()
     if (!response.ok) {
       if (typeof payload.error === 'string' && payload.error.startsWith('__L10N__')) throw new L10nError(payload.error.slice(8) as StrKey)
@@ -351,7 +352,7 @@ async function analyseImage(file: File, onProgress: (progress: number, key: StrK
   }
 }
 
-async function analysePdf(file: File, onProgress: (progress: number, key: StrKey, vars?: Record<string, string | number>) => void) {
+async function analysePdf(file: File, onProgress: (progress: number, key: StrKey, vars?: Record<string, string | number>) => void, opts: { airgapped: boolean }) {
   const loadingTask = getDocument({ data: await file.arrayBuffer() })
   const pdf = await loadingTask.promise
   try {
@@ -376,7 +377,7 @@ async function analysePdf(file: File, onProgress: (progress: number, key: StrKey
   }
   if (!text.replace(/\[PAGE \d+\]/g, '').trim()) throw new L10nError('errNoTextPdf')
   onProgress(72, 'structuringPdf')
-  const response = await fetch('/api/structure-ddr', { method: 'POST', headers: { 'content-type': 'application/json' }, body: JSON.stringify({ text, words, name: file.name }) })
+  const response = await fetch('/api/structure-ddr', { method: 'POST', headers: { 'content-type': 'application/json' }, body: JSON.stringify({ text, words, name: file.name, airgapped: opts.airgapped }) })
   const payload = await response.json()
   if (!response.ok) {
     if (typeof payload.error === 'string' && payload.error.startsWith('__L10N__')) throw new L10nError(payload.error.slice(8) as StrKey)
@@ -388,11 +389,11 @@ async function analysePdf(file: File, onProgress: (progress: number, key: StrKey
   } finally { await loadingTask.destroy() }
 }
 
-async function analyseDocument(file: File, onProgress: (progress: number, key: StrKey, vars?: Record<string, string | number>) => void) {
+async function analyseDocument(file: File, onProgress: (progress: number, key: StrKey, vars?: Record<string, string | number>) => void, opts: { airgapped: boolean }) {
   if (/\.tiff?$/i.test(file.name)) throw new L10nError('errTiff')
-  if (isImageFile(file)) return analyseImage(file, onProgress)
+  if (isImageFile(file)) return analyseImage(file, onProgress, opts)
   if (!/\.pdf$/i.test(file.name) && file.type !== 'application/pdf') throw new L10nError('errType')
-  return analysePdf(file, onProgress)
+  return analysePdf(file, onProgress, opts)
 }
 
 function haversineKm(lat1: number, lon1: number, lat2: number, lon2: number) {
@@ -649,7 +650,7 @@ function Sparkline({ values, color = '#e86b4d' }: { values: (number | null)[]; c
 }
 
 function TelemetryPanel({ report }: { report: Report }) {
-  const { t } = useLang()
+  const { t, airgapped } = useLang()
   const um = t('unitM')
   const kindLbl = (k: TelemetryAlert['kind']) => k === 'Mud Loss' ? t('kMudLoss') : k === 'Kick' ? t('kKick') : k === 'Stuck Pipe' ? t('kStuck') : k === 'Overpressure' ? t('kOver') : t('kSpike')
   const sevLbl = (s: TelemetryAlert['severity']) => s === 'high' ? t('sevHigh') : s === 'medium' ? t('sevMedium') : t('sevLow')
@@ -690,7 +691,7 @@ function TelemetryPanel({ report }: { report: Report }) {
         const deduped = fresh.filter(f => !ids.has(f.id))
         return deduped.length ? [...deduped, ...a].slice(0, 20) : a
       })
-      if (isSupabaseConfigured) {
+      if (isSupabaseConfigured && !airgapped) {
         for (const fa of fresh) {
           saveAlertToSupabase(report.well_name, { time: fa.time, depth: fa.depth, kind: fa.kind, severity: fa.severity, message: enText(fa.messageKey, fa.messageVars), evidence: fa.evidence === '__NONE__' ? enText('noOffsetEv') : fa.evidence.startsWith('__SIM__') ? enText('simHazard', { f: fa.evidence.slice(7) }) : fa.evidence }).catch(() => {})
         }
@@ -700,7 +701,7 @@ function TelemetryPanel({ report }: { report: Report }) {
 
   // persist telemetry batch best-effort when samples first generated
   useEffect(() => {
-    if (!isSupabaseConfigured || samples.length === 0) return
+    if (!isSupabaseConfigured || airgapped || samples.length === 0) return
     const batch = samples.slice(0, 30).map(s => ({
       time: s.time, depth: s.depth, wob: s.wob, rop: s.rop, rpm: s.rpm, torque: s.torque, spp: s.spp,
       flow_in: s.flowIn, flow_out: s.flowOut, mud_weight: s.mudWeight, gas: s.gas, hook_load: s.hookLoad, quality: s.quality,
@@ -816,7 +817,7 @@ function EmbeddingPanel({ documents }: { documents: IndexedDocument[] }) {
 }
 
 function PredictionPanel({ document, question, setQuestion }: { document: IndexedDocument; question: string; setQuestion: (value: string) => void }) {
-  const { t } = useLang()
+  const { t, airgapped } = useLang()
   const [answer, setAnswer] = useState(''); const [asking, setAsking] = useState(false)
   const [mudDelta, setMudDelta] = useState(0)
   const [flowDelta, setFlowDelta] = useState(0)
@@ -826,7 +827,7 @@ function PredictionPanel({ document, question, setQuestion }: { document: Indexe
   const baseMud = parseMudWeight(document.report.mud_weight)
   const whatIfRisks = useMemo(() => computeWhatIfRisks(document.report.risks || [], mudDelta, flowDelta, wobDelta), [document.report.risks, mudDelta, flowDelta, wobDelta])
   const hasWhatIf = mudDelta !== 0 || flowDelta !== 0 || wobDelta !== 0
-  async function ask(event: FormEvent) { event.preventDefault(); if (!question.trim()) return; setAsking(true); setAnswer(''); try { const response = await fetch('/api/ask', { method: 'POST', headers: { 'content-type': 'application/json' }, body: JSON.stringify({ question, corpus: document.corpus }) }); const payload = await response.json(); if (!response.ok) throw new Error(payload.error); setAnswer(payload.answer) } catch (error) { setAnswer(error instanceof Error && error.message && !error.message.startsWith('__L10N__') ? error.message : t('errAsk')) } finally { setAsking(false) } }
+  async function ask(event: FormEvent) { event.preventDefault(); if (!question.trim()) return; setAsking(true); setAnswer(''); try { const response = await fetch('/api/ask', { method: 'POST', headers: { 'content-type': 'application/json' }, body: JSON.stringify({ question, corpus: document.corpus, airgapped }) }); const payload = await response.json(); if (!response.ok) throw new Error(payload.error); setAnswer(payload.answer) } catch (error) { setAnswer(error instanceof Error && error.message && !error.message.startsWith('__L10N__') ? error.message : t('errAsk')) } finally { setAsking(false) } }
   async function simulate() {
     if (!document.report.risks.length) { setWhatIfAnswer(t('errWhatifNoRisks')); return }
     setSimulating(true); setWhatIfAnswer('')
@@ -834,7 +835,7 @@ function PredictionPanel({ document, question, setQuestion }: { document: Indexe
     const proposed = `Mud weight Δ ${mudDelta > 0 ? '+' : ''}${mudDelta.toFixed(2)} ppg (base ${baseMud !== null ? baseMud + ' ppg' : document.report.mud_weight || 'not stated'}), Flow Δ ${flowDelta > 0 ? '+' : ''}${flowDelta}% , WOB Δ ${wobDelta > 0 ? '+' : ''}${wobDelta}% at ${value(document.report.current_md, ' m')} in ${document.report.formation || 'formation not stated'}.`
     const whatIfQuestion = `WHAT-IF SIMULATION:\nProposed action: ${proposed}\nDeterministic risk scores (transparent rule: loss +18*Δmud+0.18*Δflow, kick -22*Δmud, stuck +12*Δmud-0.12*Δflow+0.14*Δwob, clamped 5-95):\n${table}\n\nTask: Explain which risk(s) increase/decrease, why (mechanism), cite the evidence snippets above, list recommended checks and missing information. Do not invent wells or depths. If evidence is insufficient, say so.`
     try {
-      const response = await fetch('/api/ask', { method: 'POST', headers: { 'content-type': 'application/json' }, body: JSON.stringify({ question: whatIfQuestion, corpus: document.corpus }) })
+      const response = await fetch('/api/ask', { method: 'POST', headers: { 'content-type': 'application/json' }, body: JSON.stringify({ question: whatIfQuestion, corpus: document.corpus, airgapped }) })
       const payload = await response.json(); if (!response.ok) throw new Error(payload.error); setWhatIfAnswer(payload.answer)
     } catch (error) { setWhatIfAnswer(error instanceof Error && error.message ? error.message : t('errWhatif')) } finally { setSimulating(false) }
   }
@@ -869,7 +870,7 @@ function PredictionPanel({ document, question, setQuestion }: { document: Indexe
 }
 
 export default function App() {
-  const { t } = useLang()
+  const { t, airgapped } = useLang()
   const um = t('unitM'); const nf = t('notFound')
   const [view, setView] = useState<View>('command'); const [sidebarOpen, setSidebarOpen] = useState(true); const [documents, setDocuments] = useState<IndexedDocument[]>([]); const [activeName, setActiveName] = useState<string | null>(null); const [processing, setProcessing] = useState(false); const [progress, setProgress] = useState(0); const [statusKey, setStatusKey] = useState<StrKey>('statusInit'); const [statusVars, setStatusVars] = useState<Record<string, string | number>>({}); const status = t(statusKey, statusVars); const [error, setError] = useState(''); const [question, setQuestion] = useState(''); const [dragOver, setDragOver] = useState(false); const [fullscreen, setFullscreen] = useState(false)
   const [searchQuery, setSearchQuery] = useState(''); const [searchKind, setSearchKind] = useState<SearchKind>('all'); const [searchFormation, setSearchFormation] = useState('all'); const [searchSeverity, setSearchSeverity] = useState('all'); const [searchOpen, setSearchOpen] = useState(false)
@@ -885,9 +886,9 @@ export default function App() {
   useEffect(() => () => { for (const url of documentUrlMapRef.current.values()) URL.revokeObjectURL(url) }, [])
   function toggleFullscreen() { if (!window.document.fullscreenElement) { window.document.documentElement.requestFullscreen?.() } else { window.document.exitFullscreen?.() }; setFullscreen((v) => !v) }
   useEffect(() => { function handleFullscreenChange() { setFullscreen(!!window.document.fullscreenElement) }; window.document.addEventListener('fullscreenchange', handleFullscreenChange); return () => window.document.removeEventListener('fullscreenchange', handleFullscreenChange) }, [])
-  // Load persisted documents from Supabase on mount (graceful fallback if not configured)
+  // Load persisted documents from Supabase on mount (graceful fallback if not configured; skipped in airgap mode)
   useEffect(() => {
-    if (!isSupabaseConfigured) return
+    if (!isSupabaseConfigured || airgapped) return
     ;(async () => {
       try {
         const { data, error } = await loadDocumentsFromSupabase()
@@ -916,7 +917,7 @@ export default function App() {
     setProcessing(true); setProgress(1); setStatusKey('statusOpening'); setStatusVars({ name: file.name }); setView('documents')
     if (window.matchMedia('(max-width: 760px)').matches) setSidebarOpen(false)
     try {
-      const { analysis, pages } = await analyseDocument(file, (nextProgress, nextKey, nextVars) => { setProgress(nextProgress); setStatusKey(nextKey); setStatusVars(nextVars ?? {}) })
+      const { analysis, pages } = await analyseDocument(file, (nextProgress, nextKey, nextVars) => { setProgress(nextProgress); setStatusKey(nextKey); setStatusVars(nextVars ?? {}) }, { airgapped })
       const url = URL.createObjectURL(file)
       // revoke previous url for same name if exists
       const prev = documentUrlMapRef.current.get(file.name); if (prev) URL.revokeObjectURL(prev)
@@ -928,8 +929,8 @@ export default function App() {
       })
       setActiveName(file.name)
       setStatusKey('indexedMsg'); setStatusVars({ sections: analysis.report.sections.length, pages })
-      // persist to Supabase (non-blocking, graceful fallback)
-      if (isSupabaseConfigured) {
+      // persist to Supabase (non-blocking, graceful fallback; skipped in airgap mode)
+      if (isSupabaseConfigured && !airgapped) {
         const rep = analysis.report as unknown as Report
         upsertWellFromReport(rep as never).catch(() => {})
         saveDocumentToSupabase({ name: file.name, report: analysis.report, corpus: analysis.corpus, embeddingModel: analysis.embeddingModel, documentVector: analysis.documentVector, segments: analysis.segments, embeddings: analysis.embeddings, pages }).then(r => {
@@ -991,5 +992,5 @@ export default function App() {
           ))}
           <div className="search-hint">{t('searchHint')}</div>
         </div>
-              )}</div><div className="top-actions"><span className="online-pill"><i /> {processing ? t('processing', { progress }) : documents.length ? t('sitesIndexed', { count: documents.length }) : t('awaitingDoc')}</span><span className="online-pill" style={isSupabaseConfigured ? { color: '#2a9d8f', border: '1px solid #cde5e1' } : { color: '#b0b1ae', border: '1px solid #ecece8' }}><i style={{ background: isSupabaseConfigured ? '#2a9d8f' : '#b0b1ae' }} /> {isSupabaseConfigured ? t('supabase') : t('local')}</span><LanguageToggle /><button aria-label={t('notifications')}><Bell size={17} /></button><button aria-label={t('settings')}><Settings2 size={17} /></button></div></header><div className="app-layout"><aside className="sidebar"><div className="sidebar-top"><span>{t('workspace')}</span><button onClick={() => setSidebarOpen(false)} aria-label={t('collapseSidebar')}><PanelLeftClose size={15} /></button></div><nav>{navItems.map(([id, icon, label]) => <button key={id} className={view === id ? 'active' : ''} onClick={() => setView(id)}>{icon}<span>{label}</span></button>)}</nav><div className="sidebar-section"><span>{t('activeWell')}</span>{report ? <button className="well-switch" onClick={() => setView('embeddings')}><strong>{report.well_name || t('noWell')}</strong><small>{report ? `${report.formation || t('formationNFFull')} · ${value(report.current_md, um, nf)} · ${t('sitesUnit', { count: documents.length })}` : t('uploadDocs')} </small><ChevronDown size={14} /></button> : <div className="well-switch-empty" role="status"><span className="well-empty-icon"><FileScan size={18} /></span><div><strong>{t('noWell')}</strong><small>{t('uploadDocs')}</small></div></div>}{documents.length > 1 && <div style={{ display: 'grid', gap: 4, marginTop: 6, maxHeight: 132, overflowY: 'auto' }}>{documents.map((doc) => <button key={doc.name} onClick={() => setActiveName(doc.name)} style={{ textAlign: 'left', padding: '6px 8px', borderRadius: 7, border: activeName===doc.name || (!activeName && doc.name===document?.name) ? '1px solid #f0c1b4' : '1px solid var(--line)', background: activeName===doc.name || (!activeName && doc.name===document?.name) ? 'var(--coral-soft)' : 'white', fontSize: 9 }}><strong style={{ display:'block', fontSize: 9 }}>{doc.report.well_name ?? doc.name}</strong><small style={{ color: '#8a8c89' }}>{doc.report.formation ?? '—'} · {value(doc.report.current_md, um, nf)}</small></button>)}</div>}</div><div className="sidebar-section"><span>{t('qa')}</span><label className="sidebar-upload" title={t('uploadTitle')}><Upload size={15} /> {t('ingestDocs')}<input type="file" disabled={processing} multiple accept=".pdf,.png,.jpg,.jpeg,.bmp,.webp" onChange={handleUpload} /></label><button disabled={!document} onClick={() => setView('prediction')}><Sparkles size={15} /> {t('askNwisSb')}</button></div><div className="sidebar-foot"><span><i className="online-dot" /> {processing ? status : document ? t('indexReady') : t('noDataset')}</span><small>{document?.name || t('noDocCaps')}</small></div></aside><main className="main-content"><div className="page-heading"><div><span className="eyebrow">{view === 'command' ? t('eyebrowField') : view === 'documents' ? t('docIntel') : view === 'embeddings' ? t('eyebrowGraph') : t('eyebrowDecision')}</span><h1>{heading}</h1></div><span className="date-stamp">{report?.report_date || t('dateNA')}{report?.report_number ? ` / ${report.report_number}` : ''}</span></div>{error && <div className="pipeline-error"><AlertTriangle size={15} />{error}</div>}{processing && <section className="processing-loader" role="status" aria-live="polite"><LoaderCircle className="ocr-spinner" size={24} /><div><strong>{t('procDoc')}</strong><span>{processingFile}</span><p>{status}</p><progress max={100} value={progress} aria-label={t('procStages')} /><small>{t('procNote')}</small></div></section>}<div className="workspace" aria-busy={processing}>{renderView()}</div></main></div>{dragOver && <div className="drag-overlay"><Upload size={22} /><span>{t('dropIngest')}</span></div>}<div className="status-footer"><span><i className="online-dot" /> {processing ? status : document ? t('indexedFrom') : t('awaitingUp')}</span><span><FileText size={12} /> {document?.name || t('noDocIdx')}</span><span>{document ? t('footerStats', { s: document.report.sections.length, e: document.report.events.length, v: document.embeddings.length }) : t('noData')}</span><CircleHelp size={13} /></div></div>
+              )}</div><div className="top-actions"><span className="online-pill"><i /> {processing ? t('processing', { progress }) : documents.length ? t('sitesIndexed', { count: documents.length }) : t('awaitingDoc')}</span><span className="online-pill" style={isSupabaseConfigured ? { color: '#2a9d8f', border: '1px solid #cde5e1' } : { color: '#b0b1ae', border: '1px solid #ecece8' }}><i style={{ background: isSupabaseConfigured ? '#2a9d8f' : '#b0b1ae' }} /> {airgapped ? t('airgapped') : isSupabaseConfigured ? t('supabase') : t('local')}</span><LanguageToggle /><AirgapToggle /><button aria-label={t('notifications')}><Bell size={17} /></button><button aria-label={t('settings')}><Settings2 size={17} /></button></div></header><div className="app-layout"><aside className="sidebar"><div className="sidebar-top"><span>{t('workspace')}</span><button onClick={() => setSidebarOpen(false)} aria-label={t('collapseSidebar')}><PanelLeftClose size={15} /></button></div><nav>{navItems.map(([id, icon, label]) => <button key={id} className={view === id ? 'active' : ''} onClick={() => setView(id)}>{icon}<span>{label}</span></button>)}</nav><div className="sidebar-section"><span>{t('activeWell')}</span>{report ? <button className="well-switch" onClick={() => setView('embeddings')}><strong>{report.well_name || t('noWell')}</strong><small>{report ? `${report.formation || t('formationNFFull')} · ${value(report.current_md, um, nf)} · ${t('sitesUnit', { count: documents.length })}` : t('uploadDocs')} </small><ChevronDown size={14} /></button> : <div className="well-switch-empty" role="status"><span className="well-empty-icon"><FileScan size={18} /></span><div><strong>{t('noWell')}</strong><small>{t('uploadDocs')}</small></div></div>}{documents.length > 1 && <div style={{ display: 'grid', gap: 4, marginTop: 6, maxHeight: 132, overflowY: 'auto' }}>{documents.map((doc) => <button key={doc.name} onClick={() => setActiveName(doc.name)} style={{ textAlign: 'left', padding: '6px 8px', borderRadius: 7, border: activeName===doc.name || (!activeName && doc.name===document?.name) ? '1px solid #f0c1b4' : '1px solid var(--line)', background: activeName===doc.name || (!activeName && doc.name===document?.name) ? 'var(--coral-soft)' : 'white', fontSize: 9 }}><strong style={{ display:'block', fontSize: 9 }}>{doc.report.well_name ?? doc.name}</strong><small style={{ color: '#8a8c89' }}>{doc.report.formation ?? '—'} · {value(doc.report.current_md, um, nf)}</small></button>)}</div>}</div><div className="sidebar-section"><span>{t('qa')}</span><label className="sidebar-upload" title={t('uploadTitle')}><Upload size={15} /> {t('ingestDocs')}<input type="file" disabled={processing} multiple accept=".pdf,.png,.jpg,.jpeg,.bmp,.webp" onChange={handleUpload} /></label><button disabled={!document} onClick={() => setView('prediction')}><Sparkles size={15} /> {t('askNwisSb')}</button></div><div className="sidebar-foot"><span><i className="online-dot" /> {processing ? status : document ? t('indexReady') : t('noDataset')}</span><small>{document?.name || t('noDocCaps')}</small></div></aside><main className="main-content"><div className="page-heading"><div><span className="eyebrow">{view === 'command' ? t('eyebrowField') : view === 'documents' ? t('docIntel') : view === 'embeddings' ? t('eyebrowGraph') : t('eyebrowDecision')}</span><h1>{heading}</h1></div><span className="date-stamp">{report?.report_date || t('dateNA')}{report?.report_number ? ` / ${report.report_number}` : ''}</span></div>{error && <div className="pipeline-error"><AlertTriangle size={15} />{error}</div>}{processing && <section className="processing-loader" role="status" aria-live="polite"><LoaderCircle className="ocr-spinner" size={24} /><div><strong>{t('procDoc')}</strong><span>{processingFile}</span><p>{status}</p><progress max={100} value={progress} aria-label={t('procStages')} /><small>{t('procNote')}</small></div></section>}<div className="workspace" aria-busy={processing}>{renderView()}</div></main></div>{dragOver && <div className="drag-overlay"><Upload size={22} /><span>{t('dropIngest')}</span></div>}<div className="status-footer"><span><i className="online-dot" /> {processing ? status : document ? t('indexedFrom') : t('awaitingUp')}</span><span><FileText size={12} /> {document?.name || t('noDocIdx')}</span><span>{document ? t('footerStats', { s: document.report.sections.length, e: document.report.events.length, v: document.embeddings.length }) : t('noData')}</span><CircleHelp size={13} /></div></div>
 }
