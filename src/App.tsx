@@ -558,9 +558,14 @@ function PdfViewer({ document }: { document: IndexedDocument }) {
   const isImage = /\.(png|jpe?g|webp|tiff|bmp)$/i.test(document.name)
   useEffect(() => {
     if (isImage) return
+    if (!document.url) return
     let cancelled = false; (async () => { const pdf = await getDocument({ url: document.url }).promise; const current = await pdf.getPage(page); const viewport = current.getViewport({ scale: 1.5 }); const canvas = canvasRef.current; if (!canvas || cancelled) return; const context = canvas.getContext('2d'); if (!context) return; canvas.width = viewport.width; canvas.height = viewport.height; await current.render({ canvas, canvasContext: context, viewport }).promise })().catch(() => undefined); return () => { cancelled = true }
   }, [document.url, page, isImage])
   const segments = document.segments.filter((segment) => segment.page === page)
+  const missingSource = !document.url
+  if (missingSource) {
+    return <div className="pdf-canvas-shell"><div className="pdf-page" style={{ display: 'grid', placeItems: 'center', padding: 24, textAlign: 'center', gap: 8 }}><FileScan size={28} color="#9aa8a5" /><b style={{ color: '#314a47', fontSize: 11 }}>{t('docIntel')}</b><span style={{ color: '#7e8a88', fontSize: 10, maxWidth: 260 }}>{document.name} — source PDF not in Storage (uploaded before storage was enabled). Re-upload the file to view it.</span></div></div>
+  }
   if (isImage) return <div className="pdf-canvas-shell"><div className="pdf-page-controls"><span>{t('pageImage')}</span></div><div className="pdf-page" style={{ display: 'grid', placeItems: 'center', overflow: 'auto' }}><img src={document.url} alt={document.name} style={{ maxWidth: '100%', maxHeight: '100%', objectFit: 'contain' }} />{segments.map((segment, index) => <div key={`${segment.label}-${index}`} className={`seg-box ${segment.tone} visible`} style={{ left: `${segment.x}%`, top: `${segment.y}%`, width: `${segment.w}%`, height: `${segment.h}%` }}><span>{segment.label}</span></div>)}</div></div>
   return <div className="pdf-canvas-shell"><div className="pdf-page-controls"><button disabled={page === 1} onClick={() => setPage((current) => current - 1)}>{t('prev')}</button><span>{t('pageOf', { p: page, n: document.pages })}</span><button disabled={page === document.pages} onClick={() => setPage((current) => current + 1)}>{t('next')}</button></div><div className="pdf-page"><canvas ref={canvasRef} />{segments.map((segment, index) => <div key={`${segment.label}-${index}`} className={`seg-box ${segment.tone} visible`} style={{ left: `${segment.x}%`, top: `${segment.y}%`, width: `${segment.w}%`, height: `${segment.h}%` }}><span>{segment.label}</span></div>)}</div></div>
 }
@@ -887,7 +892,8 @@ export default function App() {
   useEffect(() => { function handleFullscreenChange() { setFullscreen(!!window.document.fullscreenElement) }; window.document.addEventListener('fullscreenchange', handleFullscreenChange); return () => window.document.removeEventListener('fullscreenchange', handleFullscreenChange) }, [])
   // Load persisted documents from Supabase on mount (graceful fallback if not configured)
   useEffect(() => {
-    if (!isSupabaseConfigured) return
+    if (!isSupabaseConfigured || !supabase) return
+    const sb = supabase
     ;(async () => {
       try {
         const { data, error } = await loadDocumentsFromSupabase()
@@ -905,9 +911,38 @@ export default function App() {
           documentVector: (d.document_vector as unknown as number[] | null) ?? (d.document_vector_json as unknown as number[] | null) ?? null,
         }))
         // only restore if local is empty to avoid overwriting fresh ingest
-        setDocuments(prev => prev.length === 0 ? restored : prev)
+        let didRestore = false
+        setDocuments(prev => {
+          if (prev.length !== 0) return prev
+          didRestore = true
+          return restored
+        })
+        if (!didRestore) return
         setActiveName(prev => prev ?? restored[0]?.name ?? null)
         if (restored.length) { setStatusKey('statusRestored'); setStatusVars({ count: restored.length }) }
+        // lazy fetch PDFs from private bucket (download -> blob URL)
+        for (const doc of restored) {
+          try {
+            const { data: blob, error: dlErr } = await sb.storage.from('documents').download(doc.name)
+            if (dlErr || !blob) {
+              // fallback: signed URL for pdfjs
+              const { data: signed, error: signErr } = await sb.storage.from('documents').createSignedUrl(doc.name, 3600)
+              if (!signErr && signed?.signedUrl) {
+                const url = signed.signedUrl
+                documentUrlMapRef.current.set(doc.name, url)
+                setDocuments(prev => prev.map(p => p.name === doc.name ? { ...p, url } : p))
+              } else {
+                console.warn('[supabase storage] download failed', doc.name, dlErr?.message ?? signErr?.message)
+              }
+              continue
+            }
+            const url = URL.createObjectURL(blob)
+            const prevUrl = documentUrlMapRef.current.get(doc.name)
+            if (prevUrl && prevUrl.startsWith('blob:')) URL.revokeObjectURL(prevUrl)
+            documentUrlMapRef.current.set(doc.name, url)
+            setDocuments(prev => prev.map(p => p.name === doc.name ? { ...p, url } : p))
+          } catch (e) { console.warn('[supabase storage] restore fetch', doc.name, e) }
+        }
       } catch (e) { console.warn('[supabase] restore failed', e) }
     })()
   }, [])
@@ -936,14 +971,11 @@ export default function App() {
           if (r.error) console.warn('[supabase] save failed', r.error)
           else { setStatusKey('indexedPersisted'); setStatusVars({ sections: analysis.report.sections.length, pages }) }
         }).catch(e => console.warn('[supabase] save error', e))
-        // try storage upload (best-effort)
+        // storage upload (best-effort) — pass File/Blob directly so supabase-js preserves content-type
         if (supabase) {
-          const sb = supabase
-          file.arrayBuffer().then(buf => {
-            sb.storage.from('documents').upload(file.name, buf, { upsert: true, contentType: file.type || 'application/pdf' }).then(({ error }) => {
-              if (error) console.warn('[supabase storage] upload', error.message)
-            })
-          }).catch(() => {})
+          supabase.storage.from('documents').upload(file.name, file, { upsert: true, contentType: file.type || 'application/pdf', cacheControl: '3600' }).then(({ error }) => {
+            if (error) console.warn('[supabase storage] upload', error.message)
+          }).catch((e) => console.warn('[supabase storage] upload', e))
         }
       }
     } catch (uploadError) { const msg = uploadError instanceof L10nError ? t(uploadError.key, uploadError.vars) : uploadError instanceof Error && uploadError.message ? uploadError.message : t('statusFailed'); setError(previous => [previous, t('docFailedWith', { name: file.name, err: msg })].filter(Boolean).join(' • ')); setStatusKey('statusFailed'); setStatusVars({}) } finally { setProgress(100) }
