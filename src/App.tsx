@@ -6,6 +6,8 @@ import type { FeatureCollection, Point } from 'geojson'
 import 'maplibre-gl/dist/maplibre-gl.css'
 import { getDocument, GlobalWorkerOptions } from 'pdfjs-dist'
 import pdfWorkerUrl from 'pdfjs-dist/build/pdf.worker.min.mjs?url'
+import ReactMarkdown from 'react-markdown'
+import remarkGfm from 'remark-gfm'
 
 // Vite serves workers as ESM – wire maplibre's worker to avoid
 // "blocked because of a disallowed MIME type" in dev (localhost:5173)
@@ -872,9 +874,9 @@ function PredictionPanel({ document, question, setQuestion }: { document: Indexe
       )}
       {!document.report.risks.length && <small className="whatif-empty">{t('noRisksWhatif')}</small>}
       <button className="whatif-sim-btn" onClick={simulate} disabled={simulating}><BrainCircuit size={14} /> {simulating ? t('simulating') : hasWhatIf ? t('simBtn') : t('explainBtn')}</button>
-      {whatIfAnswer && <div className="whatif-answer"><div className="prediction-result-head"><span className="result-chip"><BrainCircuit size={13} /> {t('groqWhatif')}</span><button onClick={() => setWhatIfAnswer('')} aria-label={t('close')}><X size={14} /></button></div><p className="ai-answer">{whatIfAnswer}</p></div>}
+      {whatIfAnswer && <div className="whatif-answer"><div className="prediction-result-head"><span className="result-chip"><BrainCircuit size={13} /> {t('groqWhatif')}</span><button onClick={() => setWhatIfAnswer('')} aria-label={t('close')}><X size={14} /></button></div><div className="ai-answer"><ReactMarkdown remarkPlugins={[remarkGfm]}>{whatIfAnswer}</ReactMarkdown></div></div>}
     </div>
-    {answer ? <div className="prediction-result"><div className="prediction-result-head"><span className="result-chip"><BrainCircuit size={13} /> {t('groqAnalysis')}</span><button onClick={() => setAnswer('')} aria-label={t('closeAnswer')}><X size={14} /></button></div><h3>{question}</h3><p className="ai-answer">{answer}</p></div> : <>
+    {answer ? <div className="prediction-result"><div className="prediction-result-head"><span className="result-chip"><BrainCircuit size={13} /> {t('groqAnalysis')}</span><button onClick={() => setAnswer('')} aria-label={t('closeAnswer')}><X size={14} /></button></div><h3>{question}</h3><div className="ai-answer"><ReactMarkdown remarkPlugins={[remarkGfm]}>{answer}</ReactMarkdown></div></div> : <>
       <p className="prediction-intro">{t('askIntro')}</p>
       <form className="ask-form" onSubmit={ask}><textarea value={question} onChange={(event) => setQuestion(event.target.value)} placeholder={t('askPh')} /><button type="submit" disabled={asking}><Send size={15} /> {asking ? t('analysing') : t('askBtn')}</button></form>
     </>}
