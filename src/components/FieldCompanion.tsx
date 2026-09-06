@@ -32,9 +32,9 @@ function Scanner({ onRead, onClose, preferredCamera }: { onRead: (text: string) 
 function TransferQr({ frames }: { frames: string[] }) {
   const [index, setIndex] = useState(0), [paused, setPaused] = useState(false), [src, setSrc] = useState('')
   useEffect(() => { setIndex(0) }, [frames])
-  useEffect(() => { if (paused || frames.length < 2) return; const timer = setInterval(() => setIndex(i => (i + 1) % frames.length), 1500); return () => clearInterval(timer) }, [frames, paused])
-  useEffect(() => { let live = true; QRCode.toDataURL(frames[index] || frames[0], { width: 560, margin: 5, errorCorrectionLevel: 'Q', color: { dark: '#111111', light: '#ffffff' } }).then(s => { if (live) setSrc(s) }); return () => { live = false } }, [frames, index])
-  return <div className="field-qr">{src && <img src={src} alt="NWIS offline transfer QR code" />}<p>Frame {index + 1} of {frames.length} · Keep this screen visible until the laptop finishes scanning.</p>{frames.length > 1 && <div className="field-actions"><button onClick={() => setPaused(p => !p)}>{paused ? 'Play' : 'Pause'}</button><button onClick={() => { setPaused(true); setIndex(i => (i + 1) % frames.length) }}>Next frame</button></div>}</div>
+  useEffect(() => { if (paused || frames.length < 2) return; const timer = setInterval(() => setIndex(i => (i + 1) % frames.length), 3000); return () => clearInterval(timer) }, [frames, paused])
+  useEffect(() => { let live = true; QRCode.toDataURL(frames[index] || frames[0], { width: 640, margin: 6, errorCorrectionLevel: 'M', color: { dark: '#000000', light: '#ffffff' } }).then(s => { if (live) setSrc(s) }); return () => { live = false } }, [frames, index])
+  return <div className="field-qr">{src && <img src={src} alt="NWIS offline transfer QR code" />}<p>{frames.length === 1 ? 'One code · Hold it steady until the laptop confirms receipt.' : `Frame ${index + 1} of ${frames.length} · Keep this screen visible until every frame is received.`}</p>{frames.length > 1 && <div className="field-actions"><button onClick={() => setPaused(p => !p)}>{paused ? 'Play' : 'Pause'}</button><button onClick={() => { setPaused(true); setIndex(i => (i + 1) % frames.length) }}>Next frame</button></div>}</div>
 }
 type WellReport = { well: string; depth: number | null; formations: { name: string; top_md: number | null; bottom_md: number | null }[] }
 export default function FieldCompanion({ receiver = false, wells = [], reports = [], onApplied }: { receiver?: boolean; wells?: string[]; reports?: WellReport[]; onApplied?: (notes: FieldNote[]) => void }) {
