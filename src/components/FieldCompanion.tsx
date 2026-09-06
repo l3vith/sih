@@ -1,6 +1,7 @@
 import { useEffect, useRef, useState } from 'react'
 import QRCode from 'qrcode'
-import QrScanner from 'qr-scanner'
+import { BrowserQRCodeReader } from '@zxing/browser'
+import { DecodeHintType } from '@zxing/library'
 import { get, set, update } from 'idb-keyval'
 import { FrameCollector, framesFor, validatePackage, type FieldNote, type FieldPackage } from '../lib/field-transfer'
 import './FieldCompanion.css'
@@ -15,25 +16,33 @@ function download(data: unknown, name: string) {
 function Scanner({ onRead, onClose, preferredCamera }: { onRead: (text: string) => Promise<void>; onClose: () => void; preferredCamera: 'user' | 'environment' }) {
   const video = useRef<HTMLVideoElement>(null), callback = useRef(onRead)
   callback.current = onRead
-  const [error, setError] = useState('')
+  const [error, setError] = useState(''), [camera, setCamera] = useState('Starting camera…')
   useEffect(() => {
-    let busy = false
-    const scanner = new QrScanner(video.current!, async result => {
-      if (busy) return; busy = true
-      try { await callback.current(result.data); setError('') } catch (e) {
+    let busy = false, stopped = false, stop = () => {}
+    const secure = window.isSecureContext || ['localhost', '127.0.0.1'].includes(window.location.hostname)
+    if (!secure) { setError('Camera scanning requires HTTPS. Open the deployed NWIS site, or use Import update file.'); return }
+    const reader = new BrowserQRCodeReader(new Map([[DecodeHintType.TRY_HARDER, true]]), { delayBetweenScanAttempts: 60, delayBetweenScanSuccess: 150, tryPlayVideoTimeout: 8000 })
+    const constraints: MediaStreamConstraints = { audio: false, video: { facingMode: { ideal: preferredCamera }, width: { ideal: 3840, min: 1280 }, height: { ideal: 2160, min: 720 }, frameRate: { ideal: 30 } } }
+    reader.decodeFromConstraints(constraints, video.current!, (result) => {
+      if (!result || busy || stopped) return
+      busy = true
+      void callback.current(result.getText()).then(() => setError('')).catch(e => {
         const message = String((e as Error).message)
         if (!/Incomplete QR read|not an NWIS transfer QR/i.test(message)) setError(message)
-      } finally { busy = false }
-    }, { returnDetailedScanResult: true, preferredCamera, highlightScanRegion: true, highlightCodeOutline: true, maxScansPerSecond: 12, calculateScanRegion: video => {
-      const size = Math.round(Math.min(video.videoWidth, video.videoHeight) * 0.9)
-      return { x: Math.round((video.videoWidth - size) / 2), y: Math.round((video.videoHeight - size) / 2), width: size, height: size, downScaledWidth: 800, downScaledHeight: 800 }
-    } })
-    const secure = window.isSecureContext || ['localhost', '127.0.0.1'].includes(window.location.hostname)
-    if (!secure) { setError('Camera scanning requires HTTPS. Open the deployed NWIS site, or use Import update file.'); return () => scanner.destroy() }
-    scanner.start().catch(() => setError('Camera unavailable. Allow camera access in browser settings, then retry.'))
-    return () => scanner.destroy()
+      }).finally(() => { busy = false })
+    }).then(controls => {
+      if (stopped) { controls.stop(); return }
+      stop = () => controls.stop()
+      const stream = video.current?.srcObject as MediaStream | null
+      const track = stream?.getVideoTracks()[0]
+      const settings = track?.getSettings()
+      setCamera(settings?.width && settings?.height ? `${settings.width} × ${settings.height} camera · high-accuracy scan active` : 'High-accuracy scan active')
+      const capabilities = track?.getCapabilities() as MediaTrackCapabilities & { focusMode?: string[] }
+      if (capabilities?.focusMode?.includes('continuous')) void track?.applyConstraints({ advanced: [{ focusMode: 'continuous' } as MediaTrackConstraintSet] }).catch(() => {})
+    }).catch(() => setError('Camera unavailable. Allow camera access in browser settings, then retry.'))
+    return () => { stopped = true; stop() }
   }, [preferredCamera])
-  return <div className="field-scan"><video ref={video} playsInline muted /><p>{error || 'Hold the QR 20–35 cm from the camera and fill most of the scan box. Keep it steady and avoid glare.'}</p><button onClick={onClose}>Stop camera</button></div>
+  return <div className="field-scan"><div className="field-scan-stage"><video ref={video} playsInline muted /><span className="field-scan-frame" aria-hidden="true" /></div><strong>{camera}</strong><p>{error || 'Place the entire QR inside the frame. Scanning continues automatically until the transfer is complete.'}</p><button onClick={onClose}>Stop camera</button></div>
 }
 function TransferQr({ frames }: { frames: string[] }) {
   const [index, setIndex] = useState(0), [paused, setPaused] = useState(false), [src, setSrc] = useState('')
