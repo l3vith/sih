@@ -35,6 +35,19 @@ const style: StyleSpecification = {
   ],
 }
 
+function haversineKm(lat1: number, lon1: number, lat2: number, lon2: number) {
+  const R = 6371
+  const dLat = ((lat2 - lat1) * Math.PI) / 180
+  const dLon = ((lon2 - lon1) * Math.PI) / 180
+  const a =
+    Math.sin(dLat / 2) ** 2 +
+    Math.cos((lat1 * Math.PI) / 180) * Math.cos((lat2 * Math.PI) / 180) * Math.sin(dLon / 2) ** 2
+  return 2 * R * Math.asin(Math.sqrt(a))
+}
+
+const HOVER_NEIGHBOURS = 3
+const emptyLinks = (): FeatureCollection => ({ type: 'FeatureCollection', features: [] })
+
 export default function AllDocumentsMap({ documents, activeName, onSelect }: {
   documents: MapDocument[]
   activeName: string
@@ -64,6 +77,9 @@ export default function AllDocumentsMap({ documents, activeName, onSelect }: {
     })),
   }), [shown, activeName])
 
+  const shownRef = useRef(shown)
+  shownRef.current = shown
+
   useEffect(() => {
     if (!containerRef.current || features.features.length === 0) return
     mapRef.current?.remove()
@@ -72,6 +88,61 @@ export default function AllDocumentsMap({ documents, activeName, onSelect }: {
     const map = new MapLibreMap({ container: containerRef.current, style, center: selected || coordinates[0], zoom: 8, minZoom: 3, maxZoom: 16, attributionControl: false, renderWorldCopies: false })
     mapRef.current = map
     map.addControl(new NavigationControl({ showCompass: true }), 'top-right')
+    type GeojsonSource = { setData: (data: unknown) => void }
+    const setSourceData = (id: string, data: unknown) => {
+      try { (map.getSource(id) as unknown as GeojsonSource | undefined)?.setData(data) } catch { /* ignore */ }
+    }
+    const formatKm = (km: number) => (km < 10 ? `${km.toFixed(1)} km` : `${Math.round(km)} km`)
+    const clearHoverLinks = () => {
+      setSourceData('hover-links', emptyLinks())
+      setSourceData('hover-link-labels', emptyLinks())
+      setSourceData('hover-ring', emptyLinks())
+    }
+    const showHoverLinks = (docName: string) => {
+      const docs = shownRef.current
+      const hovered = docs.find((doc) => doc.name === docName)
+      if (!hovered || !Number.isFinite(hovered.report.latitude) || !Number.isFinite(hovered.report.longitude)) {
+        clearHoverLinks()
+        return
+      }
+      const lat1 = hovered.report.latitude as number
+      const lon1 = hovered.report.longitude as number
+      const neighbours = docs
+        .filter((doc) => doc.name !== docName && Number.isFinite(doc.report.latitude) && Number.isFinite(doc.report.longitude))
+        .map((doc) => ({
+          doc,
+          km: haversineKm(lat1, lon1, doc.report.latitude as number, doc.report.longitude as number),
+        }))
+        .sort((a, b) => a.km - b.km)
+        .slice(0, HOVER_NEIGHBOURS)
+      if (!neighbours.length) { clearHoverLinks(); return }
+      setSourceData('hover-links', {
+        type: 'FeatureCollection',
+        features: neighbours.map(({ doc }) => ({
+          type: 'Feature',
+          properties: {},
+          geometry: {
+            type: 'LineString',
+            coordinates: [[lon1, lat1], [doc.report.longitude as number, doc.report.latitude as number]],
+          },
+        })),
+      })
+      setSourceData('hover-link-labels', {
+        type: 'FeatureCollection',
+        features: neighbours.map(({ doc, km }) => ({
+          type: 'Feature',
+          properties: { label: `${doc.report.well_name || doc.name} · ${formatKm(km)}` },
+          geometry: {
+            type: 'Point',
+            coordinates: [(lon1 + (doc.report.longitude as number)) / 2, (lat1 + (doc.report.latitude as number)) / 2],
+          },
+        })),
+      })
+      setSourceData('hover-ring', {
+        type: 'FeatureCollection',
+        features: [{ type: 'Feature', properties: {}, geometry: { type: 'Point', coordinates: [lon1, lat1] } }],
+      })
+    }
     map.on('load', () => {
       map.addSource('uploaded-documents', { type: 'geojson', data: features })
       map.addLayer({ id: 'uploaded-document-points', type: 'circle', source: 'uploaded-documents', paint: {
@@ -82,19 +153,40 @@ export default function AllDocumentsMap({ documents, activeName, onSelect }: {
       map.addLayer({ id: 'uploaded-document-labels', type: 'symbol', source: 'uploaded-documents', layout: {
         'text-field': ['get', 'id'], 'text-offset': [0, 1.45], 'text-size': 11, 'text-allow-overlap': false,
       }, paint: { 'text-color': '#274f4b', 'text-halo-color': '#ffffff', 'text-halo-width': 1.4 } })
+      // hover spider lines to nearest wells + distance labels (under dots, above labels)
+      map.addSource('hover-links', { type: 'geojson', data: emptyLinks() as never })
+      map.addLayer({ id: 'hover-links-line', type: 'line', source: 'hover-links', paint: {
+        'line-color': '#e86b4d', 'line-width': 2, 'line-dasharray': [5, 3], 'line-opacity': 0.95,
+      } })
+      map.addSource('hover-link-labels', { type: 'geojson', data: emptyLinks() as never })
+      map.addLayer({ id: 'hover-link-labels', type: 'symbol', source: 'hover-link-labels', layout: {
+        'text-field': ['get', 'label'], 'text-size': 11, 'text-offset': [0, -0.9],
+        'text-allow-overlap': true, 'text-ignore-placement': true,
+      }, paint: { 'text-color': '#7a2f20', 'text-halo-color': '#ffffff', 'text-halo-width': 1.6 } })
+      map.addSource('hover-ring', { type: 'geojson', data: emptyLinks() as never })
+      map.addLayer({ id: 'hover-ring', type: 'circle', source: 'hover-ring', paint: {
+        'circle-radius': 14, 'circle-color': 'transparent',
+        'circle-stroke-color': '#e86b4d', 'circle-stroke-width': 2.5, 'circle-stroke-opacity': 0.9,
+      } })
       map.on('click', 'uploaded-document-points', (event) => {
         const feature = event.features?.[0]
         if (!feature) return
         const point = feature.geometry as Point
         const properties = feature.properties || {}
+        if (properties.docName) showHoverLinks(String(properties.docName))
         new Popup({ closeButton: false, offset: 14 })
           .setLngLat(point.coordinates as [number, number])
           .setHTML(`<strong>${properties.id}</strong><br>${properties.depth ? `${Number(properties.depth).toLocaleString()} m` : 'Depth not found'} · ${properties.formation}`)
           .addTo(map)
         if (properties.docName) onSelect(String(properties.docName))
       })
+      map.on('mousemove', 'uploaded-document-points', (event) => {
+        map.getCanvas().style.cursor = 'pointer'
+        const docName = event.features?.[0]?.properties?.docName
+        if (docName) showHoverLinks(String(docName))
+      })
       map.on('mouseenter', 'uploaded-document-points', () => { map.getCanvas().style.cursor = 'pointer' })
-      map.on('mouseleave', 'uploaded-document-points', () => { map.getCanvas().style.cursor = '' })
+      map.on('mouseleave', 'uploaded-document-points', () => { map.getCanvas().style.cursor = ''; clearHoverLinks() })
       if (coordinates.length > 1) {
         const bounds: [[number, number], [number, number]] = [[...coordinates[0]], [...coordinates[0]]]
         for (const [lon, lat] of coordinates) {
@@ -114,7 +206,7 @@ export default function AllDocumentsMap({ documents, activeName, onSelect }: {
     <div ref={containerRef} className="real-map" />
     <div className="map-overlay-title">UPLOADED DOCUMENTS <span>• {shown.length} / {documents.length} LOCATED</span></div>
     <div className="map-control-strip all-documents-controls">
-      <div className="strip-well"><b>{located.length} mapped reports</b><small>Orange is selected · click any well to open its document</small></div>
+      <div className="strip-well"><b>{located.length} mapped reports</b><small>Orange is selected · hover a well for 3 nearest links · click to open</small></div>
       <label className="strip-group"><span>FORMATION</span><select value={formation} onChange={(event) => setFormation(event.target.value)}><option value="all">All formations</option>{formations.map((name) => <option key={name}>{name}</option>)}</select></label>
     </div>
   </div>
