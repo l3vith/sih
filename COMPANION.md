@@ -4,7 +4,7 @@ Open **Field updates** in the NWIS sidebar to receive notes. Open `/companion.ht
 
 ## Setup and offline use
 
-Build with `npm run build`. Serve `dist` through an HTTPS server trusted by the phone (or use localhost on the laptop). A plain LAN HTTP address cannot provide camera access or service-worker installation. No external services are needed by the companion after setup. Install the companion on the phone's home screen and wait for **Ready offline** before disconnecting. The preview server on localhost is useful for laptop testing, not phone deployment.
+Build with `npm run build`. For a local demo, run `npm run dev:https`; Vite prints an `https://` LAN address. Open that address on the phone and accept the local development certificate once. Camera QR scanning then works. A phone cannot use the laptop's `localhost` address because its own localhost refers to the phone. Serve `dist` through an HTTPS server trusted by the phone for a production deployment. A plain LAN HTTP address cannot provide camera access or service-worker installation. No external services are needed by the companion after setup. Install the companion on the phone's home screen and wait for **Ready offline** before disconnecting.
 
 Notes and photos are stored in IndexedDB on each device. Saving reports success only after the storage transaction completes. Browser data clearing or device loss removes local copies: export update files as backups. The app requests persistent storage, but the browser decides whether to grant it. Unsaved form input is not a saved note.
 
