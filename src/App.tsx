@@ -133,10 +133,25 @@ function hybridSearch(documents: IndexedDocument[], query: string, filters: { ki
   // hybrid: keyword score + slight doc-vector boost (more recent docs slightly higher) + severity boost
   return out.sort((a, b) => b.score - a.score).slice(0, 18)
 }
-function computeWhatIfRisks(risks: Risk[], mudDelta: number, flowDelta: number, wobDelta: number) {
+/** Assessed risk score for display when the DDR states no probability (the common
+ * case — the extractor must not invent percentages). Deterministic and
+ * transparent: trend base + bump when a same-report event corroborates the risk. */
+function assessRiskScore(risk: Risk, events: Event[] = []): { score: number; stated: boolean; basis: string } {
+  if (risk.probability !== null) return { score: risk.probability, stated: true, basis: `Stated in DDR: ${risk.probability}%` }
+  const base = risk.trend === 'rising' ? 62 : risk.trend === 'falling' ? 22 : risk.trend === 'steady' ? 38 : 32
+  const keywords = risk.label.toLowerCase().split(/[^a-z]+/).filter((w) => w.length > 3)
+  const corroborated = keywords.length > 0 && events.some((e) => {
+    const t = e.type.toLowerCase()
+    return keywords.some((k) => t.includes(k))
+  })
+  const score = Math.max(5, Math.min(95, base + (corroborated ? 8 : 0)))
+  const trendBit = risk.trend ? `trend ${risk.trend} → base ${base}%` : `no trend stated → base ${base}%`
+  return { score, stated: false, basis: `Assessed ${score}% — ${trendBit}${corroborated ? ' + 8% corroborated by a same-report event' : ', no corroborating event'}. DDR stated no probability.` }
+}
+function computeWhatIfRisks(risks: Risk[], mudDelta: number, flowDelta: number, wobDelta: number, events: Event[] = []) {
   return risks.map(r => {
     const label = r.label.toLowerCase()
-    const base = r.probability ?? (r.trend === 'rising' ? 62 : r.trend === 'falling' ? 22 : r.trend === 'steady' ? 38 : 32)
+    const base = assessRiskScore(r, events).score
     let adj = base as number
     if (label.includes('loss') || label.includes('lost circulation') || label.includes('circulation')) adj += mudDelta * 18 + flowDelta * 0.18
     else if (label.includes('kick') || label.includes('influx') || label.includes('gas')) adj += -mudDelta * 22 + flowDelta * 0.08
@@ -670,12 +685,13 @@ function StreamPanel({ document, status }: { document: IndexedDocument; status: 
 function RiskRow({ risks, events, openPrediction }: { risks: Risk[]; events: Event[]; openPrediction: () => void }) {
   const { t } = useLang()
   const um = t('unitM')
-  const trendLbl = (trend: Risk['trend']) => trend === 'rising' ? t('trendRising') : trend === 'falling' ? t('trendFalling') : trend === 'steady' ? t('trendSteady') : t('notStated')
+  const trendLbl = (trend: Risk['trend']) => trend === 'rising' ? t('trendRising') : trend === 'falling' ? t('trendFalling') : trend === 'steady' ? t('trendSteady') : t('trendWatch')
   const shown = risks.slice(0, 4)
   return <section className="risk-row dynamic-risk-row"><div className="risk-label"><AlertTriangle size={22} /><div><small>{t('docEvidence')}</small><strong>{t('riskWatch')}</strong></div><span className="risk-count">{risks.length ? t('tracked', { count: risks.length }) : t('noDataLbl')}</span></div><div className="risk-cards">{shown.length ? shown.map((risk) => {
     const tone = risk.trend === 'rising' ? 'critical' : risk.trend === 'falling' ? 'calm' : 'warning'
-    return <button className={`risk-card ${tone}`} key={risk.label} title={risk.evidence}><span className="risk-top"><small>{risk.label}</small><i className={`risk-dot ${risk.trend || ''}`} /></span><strong>{risk.probability === null ? '—' : <>{risk.probability}<em>%</em></>}</strong><span className={`risk-pill ${risk.trend || 'none'}`}>{trendLbl(risk.trend)}</span></button>
-  }) : <div className="no-risk-data">{t('noRiskData')}</div>}</div><div className="alerts-card"><span className="alert-count">{t('eventsLbl', { count: events.length })}</span><div className="alerts-list">{events.length ? events.slice(0, 2).map((event, index) => <span className="alert-row" key={`${event.type}-${index}`}><b>{event.time || '—'}</b> · {event.type}{event.depth === null ? '' : ` @ ${event.depth.toLocaleString()}${um}`}</span>) : <span className="alerts-empty">{t('noEvents')}</span>}</div><button onClick={openPrediction}>{t('askAboutEvents')} <ArrowUpRight size={13} /></button></div></section>
+    const assessed = assessRiskScore(risk, events)
+    return <button className={`risk-card ${tone}`} key={risk.label} title={`${risk.evidence}\n${assessed.basis}`}><span className="risk-top"><small>{risk.label}</small><i className={`risk-dot ${risk.trend || ''}`} /></span><strong>{assessed.stated ? <>{assessed.score}<em>%</em></> : <><em>~</em>{assessed.score}<em>%</em></>}</strong><span className={`risk-pill ${risk.trend || 'none'}`}>{trendLbl(risk.trend)}</span></button>
+  }) : <div className="no-risk-data">{t('noRiskData')}</div>}</div><div className="alerts-card"><span className="alert-count">{t('eventsLbl', { count: events.length })}</span><div className="alerts-list">{events.length ? events.slice(0, 2).map((event, index) => <span className="alert-row" key={`${event.type}-${index}`}><b>{event.time || '—'}</b> · {event.type}{event.depth === null ? '' : ` @ ${event.depth.toLocaleString()}${um}`}</span>) : <span className="alerts-empty">{t('noEvents')}</span>}<span className="alerts-note" title={t('assessedNote')}>{t('assessedNote')}</span></div><button onClick={openPrediction}>{t('askAboutEvents')} <ArrowUpRight size={13} /></button></div></section>
 }
 
 function Sparkline({ values, color = '#e86b4d' }: { values: (number | null)[]; color?: string }) {
@@ -872,7 +888,7 @@ function PredictionPanel({ document, question, setQuestion }: { document: Indexe
   const [whatIfAnswer, setWhatIfAnswer] = useState('')
   const [simulating, setSimulating] = useState(false)
   const baseMud = parseMudWeight(document.report.mud_weight)
-  const whatIfRisks = useMemo(() => computeWhatIfRisks(document.report.risks || [], mudDelta, flowDelta, wobDelta), [document.report.risks, mudDelta, flowDelta, wobDelta])
+  const whatIfRisks = useMemo(() => computeWhatIfRisks(document.report.risks || [], mudDelta, flowDelta, wobDelta, document.report.events || []), [document.report.risks, document.report.events, mudDelta, flowDelta, wobDelta])
   const hasWhatIf = mudDelta !== 0 || flowDelta !== 0 || wobDelta !== 0
   async function evidenceWithFieldNotes() {
     return document.corpus

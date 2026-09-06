@@ -117,12 +117,15 @@ const STR: Dict = {
   noDataLbl: { en: 'NO DATA', hi: 'कोई डेटा नहीं' },
   notStated: { en: 'NOT STATED', hi: 'नहीं दिया गया' },
   noRiskData: { en: 'No risk probabilities were stated or extracted.', hi: 'कोई जोखिम संभावना नहीं दी गई या निकाली गई।' },
+  assessedScore: { en: '~{{score}}% assessed', hi: '~{{score}}% अनुमानित' },
+  assessedNote: { en: 'DDRs rarely state probabilities — ~ scores are assessed from trend + event evidence, not stated. Hover a card for the basis.', hi: 'DDR में संभावना शायद ही कभी दी जाती है — ~ स्कोर रुझान + घटना साक्ष्य से अनुमानित हैं, कथित नहीं। आधार के लिए कार्ड पर होवर करें।' },
   eventsLbl: { en: 'EVENTS ({{count}})', hi: 'घटनाएँ ({{count}})' },
   noEvents: { en: 'No events extracted', hi: 'कोई घटना नहीं निकाली गई' },
   askAboutEvents: { en: 'ASK ABOUT EVENTS', hi: 'घटनाओं के बारे में पूछें' },
   trendRising: { en: 'rising', hi: 'बढ़ता' },
   trendSteady: { en: 'steady', hi: 'स्थिर' },
   trendFalling: { en: 'falling', hi: 'घटता' },
+  trendWatch: { en: 'watch', hi: 'निगरानी' },
 
   // Telemetry
   teleReplay: { en: 'eRTMAC TELEMETRY REPLAY', hi: 'eRTMAC टेलीमेट्री रीप्ले' },
