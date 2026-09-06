@@ -16,15 +16,37 @@ export type DbDocument = {
   report: unknown
   corpus: string | null
   embedding_model: string | null
-  document_vector: number[] | null
+  folder: string | null
+  document_vector: number[] | string | null
+  document_vector_json: number[] | string | null
   segments: unknown
   embeddings: unknown
   pages: number | null
   created_at: string
 }
 
+/** Coerce a stored vector (array, pgvector string, or null) into a number[].
+ * pgvector returns `document_vector` as a string like "[0.1,...]"; jsonb
+ * round-trips as an array. Without this, restored docs carry strings and
+ * every similarity check silently skips them. */
+export function parseVector(value: unknown): number[] | null {
+  if (Array.isArray(value)) {
+    return value.length > 0 && value.every((v) => Number.isFinite(v)) ? (value as number[]) : null
+  }
+  if (typeof value === 'string' && value.trim().length > 1) {
+    try {
+      const parsed: unknown = JSON.parse(value)
+      if (Array.isArray(parsed) && parsed.length > 0 && parsed.every((v) => typeof v === 'number' && Number.isFinite(v))) {
+        return parsed as number[]
+      }
+    } catch { /* malformed vector string */ }
+    return null
+  }
+  return null
+}
+
 // ---- Documents ----
-export async function saveDocumentToSupabase(doc: { name: string; report: unknown; corpus: string; embeddingModel: string; documentVector: number[] | null; segments: unknown; embeddings: unknown; pages: number }) {
+export async function saveDocumentToSupabase(doc: { name: string; report: unknown; corpus: string; embeddingModel: string; documentVector: number[] | null; segments: unknown; embeddings: unknown; pages: number; folder?: string | null }) {
   if (!supabase) return { error: 'Supabase not configured' as const }
   const payload = {
     name: doc.name,
@@ -32,12 +54,22 @@ export async function saveDocumentToSupabase(doc: { name: string; report: unknow
     report: doc.report,
     corpus: doc.corpus,
     embedding_model: doc.embeddingModel,
-    document_vector: doc.documentVector,
+    folder: doc.folder ?? null,
+    // jsonb round-trips as a real array; the pgvector column comes back as a
+    // string (same convention as server.mjs /api/structure-ddr persistence)
+    document_vector: null,
+    document_vector_json: doc.documentVector,
     segments: doc.segments,
     embeddings: doc.embeddings,
     pages: doc.pages,
   }
   const { error } = await supabase.from('documents').upsert(payload as never, { onConflict: 'name' })
+  return { error: error?.message ?? null }
+}
+
+export async function updateDocumentFolder(name: string, folder: string | null) {
+  if (!supabase) return { error: 'Supabase not configured' as const }
+  const { error } = await supabase.from('documents').update({ folder: folder ?? null } as never).eq('name', name)
   return { error: error?.message ?? null }
 }
 

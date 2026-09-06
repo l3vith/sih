@@ -11,9 +11,24 @@ export default function DocumentGraph({ documents, activeName, onSelect }: { doc
   const [hovered, setHovered] = useState<{ a: number; b: number; score: number } | null>(null)
   const pairs = useMemo(() => {
     const result: { a: number; b: number; score: number }[] = []
+    // vectors from Supabase can arrive as pgvector strings — coerce defensively
+    const asArray = (v: unknown): number[] | null => {
+      if (Array.isArray(v)) return v.length > 0 && v.every(Number.isFinite) ? (v as number[]) : null
+      if (typeof v === 'string' && v.trim().length > 1) {
+        try {
+          const parsed: unknown = JSON.parse(v)
+          if (Array.isArray(parsed) && parsed.length > 0 && parsed.every((n) => typeof n === 'number' && Number.isFinite(n))) return parsed as number[]
+        } catch { /* ignore */ }
+      }
+      return null
+    }
+    // legacy rows restored before the model fix carry 'supabase'/empty model —
+    // treat those as unknown rather than incompatible
+    const modelKnown = (m: unknown) => typeof m === 'string' && m.trim() !== '' && m !== 'supabase'
     documents.forEach((doc, a) => documents.slice(a + 1).forEach((other, offset) => {
-      const x = doc.documentVector, y = other.documentVector
-      if (!x?.length || !y || x.length !== y.length || doc.embeddingModel !== other.embeddingModel || !x.every(Number.isFinite) || !y.every(Number.isFinite)) return
+      const x = asArray(doc.documentVector), y = asArray(other.documentVector)
+      if (!x || !y || x.length !== y.length) return
+      if (modelKnown(doc.embeddingModel) && modelKnown(other.embeddingModel) && doc.embeddingModel !== other.embeddingModel) return
       const denominator = Math.hypot(...x) * Math.hypot(...y)
       if (!denominator) return
       const score = Math.max(-1, Math.min(1, x.reduce((sum, value, i) => sum + value * y[i], 0) / denominator))

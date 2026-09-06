@@ -33,6 +33,7 @@ create table if not exists public.documents (
   report jsonb not null,
   corpus text,
   embedding_model text,
+  folder text default null,
   -- pgvector column (384 dim for Xenova/all-MiniLM-L6-v2). Falls back to jsonb if vector ext not enabled
   document_vector vector(384),
   document_vector_json jsonb,

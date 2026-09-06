@@ -12,7 +12,7 @@ import remarkGfm from 'remark-gfm'
 // Vite serves workers as ESM – wire maplibre's worker to avoid
 // "blocked because of a disallowed MIME type" in dev (localhost:5173)
 setWorkerUrl(maplibreWorkerUrl)
-import { Activity, AlertTriangle, Anchor, ArrowUpRight, Bell, BrainCircuit, ChevronDown, CircleHelp, Crosshair, Database, FileScan, FileText, Flame, Gauge, MapPinned, LoaderCircle, Maximize2, Menu, Network, PanelLeftClose, Pause, Play, RotateCcw, Search, Send, Settings2, Sparkles, Upload, Waves, X, Zap } from 'lucide-react'
+import { Activity, AlertTriangle, Anchor, ArrowUpRight, Bell, BrainCircuit, ChevronDown, CircleHelp, Crosshair, Database, FileScan, FileText, Flame, Folder, FolderOpen, Gauge, MapPinned, LoaderCircle, Maximize2, Menu, Network, PanelLeftClose, Pause, Play, RotateCcw, Search, Send, Settings2, Sparkles, Trash2, Upload, Waves, X, Zap } from 'lucide-react'
 import { enText, useLang } from './lang'
 import type { StrKey } from './lang'
 import LanguageToggle from './components/LanguageToggle'
@@ -23,13 +23,13 @@ import FieldCompanion from './components/FieldCompanion'
 import { get as getLocal } from 'idb-keyval'
 import type { FieldNote } from './lib/field-transfer'
 import { integrateFieldNotes } from './lib/field-integration'
-import { isSupabaseConfigured, loadDocumentsFromSupabase, saveAlert as saveAlertToSupabase, saveDocumentToSupabase, saveTelemetryBatch, supabase, upsertWellFromReport } from './lib/supabase'
+import { deleteDocumentFromSupabase, isSupabaseConfigured, loadDocumentsFromSupabase, parseVector, saveAlert as saveAlertToSupabase, saveDocumentToSupabase, saveTelemetryBatch, supabase, updateDocumentFolder, upsertWellFromReport } from './lib/supabase'
 
 GlobalWorkerOptions.workerSrc = pdfWorkerUrl
 const DocumentGraph = lazy(() => import('./components/DocumentGraph'))
 const SubsurfaceView = lazy(() => import('./components/SubsurfaceView'))
 
-type View = 'command' | 'documents' | 'embeddings' | 'prediction' | 'dive' | 'field'
+type View = 'command' | 'documents' | 'embeddings' | 'prediction' | 'dive' | 'field' | 'library'
 type Segment = { page: number; x: number; y: number; w: number; h: number; label: string; tone: 'cyan' | 'amber' | 'coral' }
 type Embedding = { id: string; label: string; excerpt: string; x: number; y: number }
 type Event = { time: string | null; type: string; depth: number | null; severity: 'high' | 'medium' | 'low' | null; mitigation: string | null; evidence: string; field_note_id?: string; source?: 'field'; author?: string; formation?: string | null }
@@ -47,8 +47,11 @@ type Report = {
   field_observations?: FieldNote[]; field_depth_updated_at?: string; source_current_md?: number | null;
 }
 type Analysis = { report: Report; segments: Segment[]; embeddings: Embedding[]; embeddingModel: string; corpus: string; documentVector: number[] | null }
-type IndexedDocument = Analysis & { name: string; url: string; pages: number }
+type IndexedDocument = Analysis & { name: string; url: string; pages: number; folder?: string | null }
 type WordBox = { text: string; page: number; x: number; y: number; w: number; h: number; fromOcr?: boolean }
+type GroupBy = 'folder' | 'formation' | 'well' | 'type'
+type SortBy = 'name' | 'recent' | 'formation' | 'depth'
+const UNFILED = 'Unfiled'
 
 const mapStyle: StyleSpecification = {
   version: 8, sources: {
@@ -824,12 +827,12 @@ function EmbeddingPanel({ documents }: { documents: IndexedDocument[] }) {
   const { t } = useLang()
   const um = t('unitM')
   const [selectedName, setSelectedName] = useState<string | null>(documents[0]?.name ?? null)
-  const vectors = useMemo(() => documents.map((d) => d.documentVector).filter((v): v is number[] => Array.isArray(v) && v.length > 0), [documents])
+  const vectors = useMemo(() => documents.map((d) => parseVector(d.documentVector)).filter((v): v is number[] => v !== null), [documents])
   const positions = useMemo(() => {
     if (vectors.length === 0) return [] as { x: number; y: number }[]
     if (vectors.length === 1) return [{ x: 50, y: 50 }]
-    // if any doc missing vector (null), synthesize fallback hash to keep consistent dims – shouldn't happen after server fix
-    const filled = documents.map((d) => d.documentVector ?? Array(vectors[0].length).fill(0))
+    // if any doc missing vector (null), zero-fill to keep consistent dims
+    const filled = documents.map((d) => parseVector(d.documentVector) ?? Array(vectors[0].length).fill(0))
     // need uniform dim – pad/truncate to first vector's dim
     const dim = vectors[0].length
     const uniform = filled.map((v) => v.slice(0, dim).concat(Array(Math.max(0, dim - v.length)).fill(0)))
@@ -850,8 +853,13 @@ function EmbeddingPanel({ documents }: { documents: IndexedDocument[] }) {
     return <button key={doc.name} className={`embedding-point ${tone} ${isSel ? 'selected' : ''}`} style={{ left: `${pos.x}%`, top: `${pos.y}%` }} onClick={() => setSelectedName(doc.name)} aria-label={doc.report.well_name ?? doc.name} title={`${doc.report.well_name ?? doc.name} – ${doc.report.formation ?? ''}`} />
   })}{selected && (() => {
     const selIdx = documents.findIndex((d) => d.name === selected.name)
-    const sims = documents.filter((d) => d.name !== selected.name).map((d) => ({ name: d.report.well_name ?? d.name, score: cosine(selected.documentVector ?? [], d.documentVector ?? []) })).sort((a, b) => b.score - a.score).slice(0, 2)
-    return <div className="embedding-tooltip"><strong>{selected.report.well_name ?? selected.name}</strong><span>{selected.report.formation ?? t('formationNFFull')} · {value(selected.report.current_md, um, t('notFound'))} · {selected.report.events.length} {t('evtsWord')}</span><small style={{ display: 'block', marginTop: 6, color: '#7a8a87' }}>{sims.length ? `${t('closest')}: ${sims.map((s) => `${s.name} (${(s.score * 100).toFixed(1)}%)`).join(' · ')}` : t('noCompare')}</small></div>
+    const sims = documents.filter((d) => d.name !== selected.name).map((d) => {
+      const a = parseVector(selected.documentVector) ?? []
+      const b = parseVector(d.documentVector) ?? []
+      const score = a.length > 0 && a.length === b.length ? cosine(a, b) : NaN
+      return { name: d.report.well_name ?? d.name, score }
+    }).sort((a, b) => (Number.isNaN(b.score) ? -1 : b.score) - (Number.isNaN(a.score) ? -1 : a.score)).slice(0, 2)
+    return <div className="embedding-tooltip"><strong>{selected.report.well_name ?? selected.name}</strong><span>{selected.report.formation ?? t('formationNFFull')} · {value(selected.report.current_md, um, t('notFound'))} · {selected.report.events.length} {t('evtsWord')}</span><small style={{ display: 'block', marginTop: 6, color: '#7a8a87' }}>{sims.length ? `${t('closest')}: ${sims.map((s) => `${s.name} (${Number.isFinite(s.score) ? `${(s.score * 100).toFixed(1)}%` : '—'})`).join(' · ')}` : t('noCompare')}</small></div>
   })()}<div style={{ position: 'absolute', left: 10, bottom: 8, fontSize: 7, color: '#a0a6a2', letterSpacing: '.06em', fontWeight: 800 }}>{t('closerNote')}</div></div></>
 }
 
@@ -921,6 +929,39 @@ export default function App() {
   useEffect(() => { getLocal<FieldNote[]>('nwis-field-imports-v1').then(notes => setFieldNotes(notes || [])).catch(() => setError('Could not restore field updates from local storage.')) }, [])
   const documents = useMemo(() => integrateFieldNotes(sourceDocuments, fieldNotes), [sourceDocuments, fieldNotes])
   const searchFormationOptions = useMemo(() => { const s = new Set<string>(); for (const d of documents) { if (d.report.formation) s.add(d.report.formation); for (const e of d.report.events) if (e.formation) s.add(e.formation); for (const f of d.report.formations || []) if (f.name) s.add(f.name) } return [...s] }, [documents])
+  // Library: manual folders (persisted) + auto grouping + sort/filter + Drive view state
+  const [groupBy, setGroupBy] = useState<GroupBy>(() => {
+    try { const v = localStorage.getItem('nwis-groupBy') as GroupBy | null; return v && ['folder','formation','well','type'].includes(v) ? v : 'folder' } catch { return 'folder' }
+  })
+  const [sortBy, setSortBy] = useState<SortBy>(() => {
+    try { const v = localStorage.getItem('nwis-sortBy') as SortBy | null; return v && ['name','recent','formation','depth'].includes(v) ? v : 'recent' } catch { return 'recent' }
+  })
+  const [docFilter, setDocFilter] = useState('')
+  const [folderOrder, setFolderOrder] = useState<string[]>(() => {
+    try { const s = localStorage.getItem('nwis-folderOrder'); return s ? JSON.parse(s) as string[] : [] } catch { return [] }
+  })
+  const [extraFolders, setExtraFolders] = useState<string[]>(() => {
+    try { const s = localStorage.getItem('nwis-extraFolders'); return s ? JSON.parse(s) as string[] : [] } catch { return [] }
+  })
+  const [newFolderName, setNewFolderName] = useState('')
+  const [showNewFolder, setShowNewFolder] = useState(false)
+  const [editingFolder, setEditingFolder] = useState<string | null>(null)
+  const [editingFolderValue, setEditingFolderValue] = useState('')
+  const [collapsed, setCollapsed] = useState<Set<string>>(() => {
+    try { const s = localStorage.getItem('nwis-collapsed'); return new Set(s ? JSON.parse(s) as string[] : []) } catch { return new Set() }
+  })
+  const [moveDocName, setMoveDocName] = useState<string | null>(null)
+  const [driveViewMode, setDriveViewMode] = useState<'grid' | 'list'>(() => {
+    try { const v = localStorage.getItem('nwis-driveView') as 'grid' | 'list' | null; return v === 'list' ? 'list' : 'grid' } catch { return 'grid' }
+  })
+  const [activeDriveFolder, setActiveDriveFolder] = useState<string | null>(null)
+  const [driveDetailsDoc, setDriveDetailsDoc] = useState<string | null>(null)
+  useEffect(() => { try { localStorage.setItem('nwis-driveView', driveViewMode) } catch { /* */ } }, [driveViewMode])
+  useEffect(() => { try { localStorage.setItem('nwis-groupBy', groupBy) } catch { /* */ } }, [groupBy])
+  useEffect(() => { try { localStorage.setItem('nwis-sortBy', sortBy) } catch { /* */ } }, [sortBy])
+  useEffect(() => { try { localStorage.setItem('nwis-folderOrder', JSON.stringify(folderOrder)) } catch { /* */ } }, [folderOrder])
+  useEffect(() => { try { localStorage.setItem('nwis-extraFolders', JSON.stringify(extraFolders)) } catch { /* */ } }, [extraFolders])
+  useEffect(() => { try { localStorage.setItem('nwis-collapsed', JSON.stringify([...collapsed])) } catch { /* */ } }, [collapsed])
   const searchResults = useMemo(() => documents.length ? hybridSearch(documents, searchQuery, { kind: searchKind, formation: searchFormation, severity: searchSeverity }) : [], [documents, searchQuery, searchKind, searchFormation, searchSeverity])
   useEffect(() => {
     function onDocClick(e: MouseEvent) { if (searchRef.current && !searchRef.current.contains(e.target as Node)) setSearchOpen(false) }
@@ -940,16 +981,19 @@ export default function App() {
         const { data, error } = await loadDocumentsFromSupabase()
         if (error) { console.warn('[supabase] load error', error); return }
         if (!data || data.length === 0) return
-        const restored: IndexedDocument[] = (data as unknown as Array<{ name: string; report: Report; corpus: string | null; embedding_model: string | null; document_vector: number[] | null; document_vector_json: number[] | null; segments: Segment[] | null; embeddings: Embedding[] | null; pages: number | null }>).map(d => ({
+        const restored: IndexedDocument[] = (data as unknown as Array<{ name: string; report: Report; corpus: string | null; embedding_model: string | null; folder: string | null; document_vector: number[] | string | null; document_vector_json: number[] | string | null; segments: Segment[] | null; embeddings: Embedding[] | null; pages: number | null }>).map(d => ({
           name: d.name,
           url: '',
           pages: d.pages ?? 1,
           report: d.report as Report,
           segments: (d.segments as unknown as Segment[]) ?? [],
           embeddings: (d.embeddings as unknown as Embedding[]) ?? [],
-          embeddingModel: d.embedding_model ?? 'supabase',
+          embeddingModel: d.embedding_model || 'Xenova/all-MiniLM-L6-v2',
           corpus: d.corpus ?? '',
-          documentVector: (d.document_vector as unknown as number[] | null) ?? (d.document_vector_json as unknown as number[] | null) ?? null,
+          folder: d.folder ?? null,
+          // pgvector returns document_vector as a string; jsonb as an array —
+          // parse either so restored docs compare with freshly indexed ones
+          documentVector: parseVector(d.document_vector_json) ?? parseVector(d.document_vector) ?? null,
         }))
         // only restore if local is empty to avoid overwriting fresh ingest
         setDocuments(prev => {
@@ -995,7 +1039,10 @@ export default function App() {
       // revoke previous url for same name if exists
       const prev = documentUrlMapRef.current.get(file.name); if (prev) URL.revokeObjectURL(prev)
       documentUrlMapRef.current.set(file.name, url)
-      const next: IndexedDocument = { ...analysis, name: file.name, url, pages }
+      const existingFolder = documents.find(d => d.name === file.name)?.folder ?? null
+      const inferredFolder = showNewFolder && newFolderName.trim() ? newFolderName.trim() : null
+      const targetFolder = existingFolder ?? inferredFolder ?? (documents.length === 0 && extraFolders[0] ? extraFolders[0] : null)
+      const next: IndexedDocument = { ...analysis, name: file.name, url, pages, folder: targetFolder }
       setDocuments((prevDocs) => {
         const others = prevDocs.filter((d) => d.name !== file.name)
         return [...others, next]
@@ -1006,7 +1053,7 @@ export default function App() {
       if (isSupabaseConfigured && !airgapped) {
         const rep = analysis.report as unknown as Report
         upsertWellFromReport(rep as never).catch(() => {})
-        saveDocumentToSupabase({ name: file.name, report: analysis.report, corpus: analysis.corpus, embeddingModel: analysis.embeddingModel, documentVector: analysis.documentVector, segments: analysis.segments, embeddings: analysis.embeddings, pages }).then(r => {
+        saveDocumentToSupabase({ name: file.name, report: analysis.report, corpus: analysis.corpus, embeddingModel: analysis.embeddingModel, documentVector: analysis.documentVector, segments: analysis.segments, embeddings: analysis.embeddings, pages, folder: targetFolder }).then(r => {
           if (r.error) console.warn('[supabase] save failed', r.error)
           else { setStatusKey('indexedPersisted'); setStatusVars({ sections: analysis.report.sections.length, pages }) }
         }).catch(e => console.warn('[supabase] save error', e))
@@ -1035,9 +1082,168 @@ export default function App() {
       }
     } finally { ingestingRef.current = false; setProcessing(false) }
   }
+  // library derived state: filtered + sorted + grouped
+  const filteredDocs = useMemo(() => {
+    const q = docFilter.trim().toLowerCase()
+    if (!q) return documents
+    return documents.filter(d => `${d.name} ${d.report.well_name || ''} ${d.report.formation || ''} ${d.folder || ''}`.toLowerCase().includes(q))
+  }, [documents, docFilter])
+  const sortedDocs = useMemo(() => {
+    const arr = [...filteredDocs]
+    if (sortBy === 'name') arr.sort((a,b) => a.name.localeCompare(b.name))
+    else if (sortBy === 'formation') arr.sort((a,b) => (a.report.formation || '').localeCompare(b.report.formation || '') || a.name.localeCompare(b.name))
+    else if (sortBy === 'depth') arr.sort((a,b) => (b.report.current_md ?? -1) - (a.report.current_md ?? -1))
+    else arr.sort((a,b) => 0)
+    if (sortBy === 'recent') arr.reverse()
+    return arr
+  }, [filteredDocs, sortBy])
+  const groupKeyForDoc = (d: IndexedDocument): string => {
+    if (groupBy === 'formation') return d.report.formation || t('formationNFFull')
+    if (groupBy === 'well') return d.report.well_name || t('noWell')
+    if (groupBy === 'type') return /\.(png|jpe?g|webp|bmp)$/i.test(d.name) ? t('typeImage') : t('typePdf')
+    return d.folder || UNFILED
+  }
+  const grouped = useMemo(() => {
+    const map = new Map<string, IndexedDocument[]>()
+    for (const d of sortedDocs) {
+      const k = groupKeyForDoc(d)
+      if (!map.has(k)) map.set(k, [])
+      map.get(k)!.push(d)
+    }
+    const keys = [...map.keys()]
+    if (groupBy === 'folder') {
+      const order = [...folderOrder, ...extraFolders, UNFILED]
+      keys.sort((a,b) => {
+        const ai = order.indexOf(a), bi = order.indexOf(b)
+        if (ai !== -1 || bi !== -1) { if (ai === -1) return 1; if (bi === -1) return -1; return ai - bi }
+        return a.localeCompare(b)
+      })
+      if (!order.includes(UNFILED) && keys.includes(UNFILED)) { const idx = keys.indexOf(UNFILED); keys.splice(idx,1); keys.push(UNFILED) }
+    } else keys.sort((a,b) => a.localeCompare(b))
+    return keys.map(k => ({ key: k, docs: map.get(k)! }))
+  }, [sortedDocs, groupBy, folderOrder, extraFolders])
+  const allManualFolders = useMemo(() => {
+    const fromDocs = [...new Set(documents.map(d => d.folder).filter(Boolean) as string[])]
+    return [...new Set([...folderOrder, ...extraFolders, ...fromDocs])].filter(f => f !== UNFILED)
+  }, [documents, folderOrder, extraFolders])
+  const folderOptions = useMemo(() => [UNFILED, ...allManualFolders], [allManualFolders])
+  function createFolder() {
+    const name = newFolderName.trim()
+    if (!name || name === UNFILED || allManualFolders.includes(name)) return
+    setExtraFolders(prev => [...prev, name])
+    setFolderOrder(prev => prev.includes(name) ? prev : [...prev, name])
+    setNewFolderName(''); setShowNewFolder(false)
+  }
+  function renameFolder(oldName: string, newNameRaw: string) {
+    const newName = newNameRaw.trim()
+    if (!newName || newName === oldName || newName === UNFILED) { setEditingFolder(null); return }
+    if (allManualFolders.includes(newName)) { setEditingFolder(null); return }
+    setDocuments(prev => prev.map(d => d.folder === oldName ? { ...d, folder: newName } : d))
+    setExtraFolders(prev => prev.map(f => f === oldName ? newName : f))
+    setFolderOrder(prev => prev.map(f => f === oldName ? newName : f))
+    if (isSupabaseConfigured) documents.filter(d => d.folder === oldName).forEach(d => updateDocumentFolder(d.name, newName).catch(() => {}))
+    setEditingFolder(null)
+  }
+  function deleteFolder(name: string) {
+    if (name === UNFILED) return
+    if (!window.confirm(t('deleteFolderConfirm', { name }))) return
+    setDocuments(prev => prev.map(d => d.folder === name ? { ...d, folder: null } : d))
+    setExtraFolders(prev => prev.filter(f => f !== name))
+    setFolderOrder(prev => prev.filter(f => f !== name))
+    if (isSupabaseConfigured) documents.filter(d => d.folder === name).forEach(d => updateDocumentFolder(d.name, null).catch(()=>{}))
+  }
+  async function moveDocToFolder(docName: string, folder: string | null) {
+    const target = folder === UNFILED ? null : folder
+    setDocuments(prev => prev.map(d => d.name === docName ? { ...d, folder: target } : d))
+    setMoveDocName(null)
+    if (isSupabaseConfigured) {
+      const { error } = await updateDocumentFolder(docName, target)
+      if (error) console.warn('[supabase] move folder', error)
+    }
+  }
+  async function deleteDoc(docName: string) {
+    if (!window.confirm(t('deleteDocConfirm', { name: docName }))) return
+    const url = documentUrlMapRef.current.get(docName)
+    if (url && url.startsWith('blob:')) URL.revokeObjectURL(url)
+    documentUrlMapRef.current.delete(docName)
+    setDocuments(prev => prev.filter(d => d.name !== docName))
+    setActiveName(prev => prev === docName ? (documents.find(d => d.name !== docName)?.name ?? null) : prev)
+    if (isSupabaseConfigured && supabase) {
+      const { error } = await deleteDocumentFromSupabase(docName)
+      if (error) console.warn('[supabase] delete doc', error)
+      supabase.storage.from('documents').remove([docName]).then(({ error: e2 }) => { if (e2) console.warn('[storage] remove', e2.message) })
+    }
+  }
+  function toggleCollapsed(key: string) {
+    setCollapsed(prev => { const next = new Set(prev); if (next.has(key)) next.delete(key); else next.add(key); return next })
+  }
+
   const report = document?.report
-  const navItems: [View, ReactNode, string][] = [['command', <Crosshair size={17} />, t('navCommand')], ['dive', <Waves size={17} />, t('navDive')], ['documents', <FileScan size={17} />, t('navDocs')], ['embeddings', <Network size={17} />, t('navEmbed')], ['prediction', <BrainCircuit size={17} />, t('navPredict')], ['field', <FileText size={17} />, 'Field updates']]
+  const navItems: [View, ReactNode, string][] = [['command', <Crosshair size={17} />, t('navCommand')], ['library', <Folder size={17} />, t('navLibrary')], ['dive', <Waves size={17} />, t('navDive')], ['documents', <FileScan size={17} />, t('navDocs')], ['embeddings', <Network size={17} />, t('navEmbed')], ['prediction', <BrainCircuit size={17} />, t('navPredict')], ['field', <FileText size={17} />, 'Field updates']]
   function renderView() {
+    if (view === 'library') {
+      const detailsDoc = driveDetailsDoc ? documents.find(d => d.name === driveDetailsDoc) ?? null : null
+      const isFolderMode = groupBy === 'folder'
+      const showFolders = isFolderMode && !activeDriveFolder
+      const activeFolderDocs = activeDriveFolder ? sortedDocs.filter(d => (d.folder || UNFILED) === activeDriveFolder) : []
+      const fileCountLabel = `${documents.length} ${t('docsWord')}`
+      return <div className="drive-view">
+        <div className="drive-toolbar">
+          <div className="drive-breadcrumb">
+            <button className={activeDriveFolder ? '' : 'active'} onClick={() => setActiveDriveFolder(null)}><FolderOpen size={14} /> {t('myDrive')}</button>
+            {activeDriveFolder && <><span>›</span><span className="drive-crumb-active"><Folder size={14} /> {activeDriveFolder}</span><button className="drive-crumb-clear" onClick={() => setActiveDriveFolder(null)}><X size={12} /></button></>}
+          </div>
+          <div className="drive-actions">
+            <label className="drive-search"><Search size={14} /><input placeholder={t('filterDocs')} value={docFilter} onChange={e => setDocFilter(e.target.value)} />{docFilter && <button onClick={() => setDocFilter('')}><X size={12} /></button>}</label>
+            <select value={groupBy} onChange={e => { setGroupBy(e.target.value as GroupBy); setActiveDriveFolder(null) }}><option value="folder">{t('gFolder')}</option><option value="formation">{t('gFormation')}</option><option value="well">{t('gWell')}</option><option value="type">{t('gType')}</option></select>
+            <select value={sortBy} onChange={e => setSortBy(e.target.value as SortBy)}><option value="recent">{t('sRecent')}</option><option value="name">{t('sName')}</option><option value="formation">{t('sFormation')}</option><option value="depth">{t('sDepth')}</option></select>
+            <div className="drive-view-toggle"><button className={driveViewMode === 'grid' ? 'active' : ''} onClick={() => setDriveViewMode('grid')} aria-label={t('viewGrid')}><span style={{ display: 'grid', gridTemplateColumns: '1fr 1fr', gap: 2, width: 12, height: 12 }}><i style={{ background: 'currentColor', borderRadius: 1 }} /><i style={{ background: 'currentColor', borderRadius: 1 }} /><i style={{ background: 'currentColor', borderRadius: 1 }} /><i style={{ background: 'currentColor', borderRadius: 1 }} /></span></button><button className={driveViewMode === 'list' ? 'active' : ''} onClick={() => setDriveViewMode('list')} aria-label={t('viewList')}><span style={{ display: 'grid', gap: 2, width: 14 }}><i style={{ height: 3, background: 'currentColor', borderRadius: 1 }} /><i style={{ height: 3, background: 'currentColor', borderRadius: 1 }} /><i style={{ height: 3, background: 'currentColor', borderRadius: 1 }} /></span></button></div>
+            {isFolderMode && <div className="drive-new-folder">{showNewFolder ? <><input autoFocus placeholder={t('folderNamePh')} value={newFolderName} onChange={e => setNewFolderName(e.target.value)} onKeyDown={e => { if (e.key === 'Enter') createFolder(); if (e.key === 'Escape') { setShowNewFolder(false); setNewFolderName('') } }} /><button className="drive-create-btn" onClick={createFolder}>{t('createBtn')}</button><button className="drive-cancel-btn" onClick={() => { setShowNewFolder(false); setNewFolderName('') }}>{t('cancelBtn')}</button></> : <button className="drive-new-btn" onClick={() => setShowNewFolder(true)}><Folder size={14} /> {t('newFolder')}</button>}</div>}
+            <label className="drive-upload-btn"><Upload size={14} /> Upload<input type="file" multiple accept=".pdf,.png,.jpg,.jpeg,.bmp,.webp" onChange={handleUpload} disabled={processing} /></label>
+          </div>
+        </div>
+        {documents.length === 0 ? <div className="drive-empty"><FolderOpen size={32} /><h3>{t('driveEmptyTitle')}</h3><p>{t('driveEmptyBody')}</p><label className="coral-action" style={{ cursor: 'pointer' }}><Upload size={14} /> {t('ingestDocs')}<input type="file" multiple accept=".pdf,.png,.jpg,.jpeg,.bmp,.webp" onChange={handleUpload} style={{ display: 'none' }} /></label></div> : <>
+          {showFolders && <section className="drive-section"><h4><Folder size={12} /> {t('gFolder')} · {allManualFolders.length + 1}</h4><div className={`drive-folder-grid ${driveViewMode}`}>{folderOptions.map(fname => {
+            const count = fname === UNFILED ? documents.filter(d => !d.folder).length : documents.filter(d => d.folder === fname).length
+            if (docFilter && fname !== UNFILED && !fname.toLowerCase().includes(docFilter.toLowerCase()) && count === 0) return null
+            const isUnfiled = fname === UNFILED
+            return <div key={fname} className={`drive-folder-card ${editingFolder === fname ? 'editing' : ''}`} onClick={() => { if (editingFolder !== fname) setActiveDriveFolder(fname) }} draggable={false} onDragOver={e => { e.preventDefault(); e.currentTarget.classList.add('drag-over') }} onDragLeave={e => e.currentTarget.classList.remove('drag-over')} onDrop={e => { e.preventDefault(); e.currentTarget.classList.remove('drag-over'); const name = e.dataTransfer.getData('text/plain'); if (name) moveDocToFolder(name, fname) }}>
+              <div className="drive-folder-icon"><Folder size={22} /></div><div className="drive-folder-meta">{editingFolder === fname ? <input autoFocus value={editingFolderValue} onChange={e => setEditingFolderValue(e.target.value)} onKeyDown={e => { if (e.key === 'Enter') renameFolder(fname, editingFolderValue); if (e.key === 'Escape') setEditingFolder(null) }} onBlur={() => setEditingFolder(null)} /> : <><strong>{fname}</strong><small>{t('docCount', { count })}</small></>}</div>{!isUnfiled && editingFolder !== fname && <div className="drive-folder-ops"><button onClick={e => { e.stopPropagation(); setEditingFolder(fname); setEditingFolderValue(fname) }}>{t('renameFolder')}</button><button onClick={e => { e.stopPropagation(); deleteFolder(fname) }}>{t('deleteFolder')}</button></div>}</div>
+          })}</div></section>}
+          {activeDriveFolder && <div className="drive-active-folder-bar"><span><Folder size={12} /> {activeDriveFolder} · {activeFolderDocs.length} {t('docsWord')}</span><button onClick={() => setActiveDriveFolder(null)}>{t('breadcrumbAll')}</button></div>}
+          <section className="drive-section">
+            <h4><FileText size={12} /> {activeDriveFolder ? activeDriveFolder : (groupBy === 'folder' && !showFolders ? t('breadcrumbAll') : t('docsWord'))} · {activeDriveFolder ? activeFolderDocs.length : grouped.reduce((n,g)=>n+g.docs.length,0)} <span style={{ color: '#8a9e9c', fontWeight: 600 }}>{fileCountLabel}</span></h4>
+            {(() => {
+              const lists: { key: string; docs: IndexedDocument[] }[] = activeDriveFolder ? [{ key: activeDriveFolder, docs: activeFolderDocs }] : grouped
+              if (lists.length === 0 || lists.every(g => g.docs.length === 0)) return <div className="drive-empty-inline"><FileScan size={20} /><span>{t('noDocsInFolder')}</span></div>
+              return <div className={`drive-file-area ${driveViewMode}`}>{lists.map(group => (
+                <div key={group.key} className="drive-file-group">
+                  {!activeDriveFolder && lists.length > 1 && <div className="drive-group-head"><span>{group.key}</span><small>{t('docCount', { count: group.docs.length })}</small><button onClick={() => toggleCollapsed(group.key)}>{collapsed.has(group.key) ? '▸' : '▾'}</button></div>}
+                  {!collapsed.has(group.key) && <div className={`drive-file-grid ${driveViewMode}`}>
+                    {group.docs.map(doc => {
+                      const isActive = activeName === doc.name
+                      const isSelectedDetails = driveDetailsDoc === doc.name
+                      const missing = !doc.url
+                      const typeLabel = /\.(png|jpe?g|webp|bmp)$/i.test(doc.name) ? t('typeImage') : t('typePdf')
+                      return <div key={doc.name} className={`drive-file-card ${isActive ? 'active' : ''} ${isSelectedDetails ? 'selected' : ''} ${missing ? 'missing' : ''}`} draggable onDragStart={e => e.dataTransfer.setData('text/plain', doc.name)} onClick={() => { setActiveName(doc.name); setDriveDetailsDoc(doc.name) }}>
+                        <div className="drive-file-thumb"><FileText size={18} /><span className="drive-file-type">{typeLabel}</span>{missing && <span className="drive-missing-badge">no PDF</span>}</div>
+                        <div className="drive-file-info"><strong title={doc.name}>{doc.report.well_name || doc.name}</strong><small title={doc.name}>{doc.name}</small><small>{doc.report.formation || t('formationNA2')} · {value(doc.report.current_md, ' m', t('notFound'))} · {(doc.folder || t('unfiled'))}</small></div>
+                        <div className="drive-file-actions" onClick={e => e.stopPropagation()}>
+                          <button title={t('openDoc')} onClick={() => { setActiveName(doc.name); setView('documents') }}><Maximize2 size={12} /></button>
+                          <div className="lib-move-wrap"><button title={t('moveTo')} onClick={() => setMoveDocName(moveDocName === doc.name ? null : doc.name)}><Folder size={12} /></button>{moveDocName === doc.name && <div className="lib-move-menu">{folderOptions.map(f => <button key={f} onClick={() => moveDocToFolder(doc.name, f)}>{f}{(doc.folder || UNFILED) === f ? ' ✓' : ''}</button>)}</div>}</div>
+                          <button title={t('deleteDoc')} onClick={() => deleteDoc(doc.name)}><Trash2 size={12} /></button>
+                        </div>
+                      </div>
+                    })}
+                  </div>}
+                </div>
+              ))}</div>
+            })()}
+          </section>
+          {detailsDoc && <aside className="drive-details"><div className="drive-details-head"><strong>{detailsDoc.report.well_name || detailsDoc.name}</strong><button onClick={() => setDriveDetailsDoc(null)}><X size={14} /></button></div><div className="drive-details-body"><small>{detailsDoc.name}</small><span>{detailsDoc.report.formation || t('formationNA2')} · {value(detailsDoc.report.current_md, ' m', t('notFound'))}</span><span>{detailsDoc.folder || t('unfiled')} · {detailsDoc.pages} {t('pages', { count: detailsDoc.pages })}</span><span>{detailsDoc.report.events.length} events · {detailsDoc.report.risks.length} risks</span><div className="drive-details-actions"><button onClick={() => { setActiveName(detailsDoc.name); setView('documents') }}><FileScan size={12} /> {t('openDoc')}</button><button onClick={() => setView('command')}><MapPinned size={12} /> {t('navCommand')}</button></div></div></aside>}
+        </>}
+      </div>
+    }
     if (view === 'field') return <FieldCompanion receiver wells={documents.map(d => d.report.well_name || d.name)} reports={sourceDocuments.map(d => ({ well: d.report.well_name || d.name, depth: d.report.current_md, formations: d.report.formations || [] }))} onApplied={setFieldNotes} />
     if (documents.length === 0) return processing ? null : <EmptyWorkspace view={view} />
     if (!document || !report) return <EmptyWorkspace view={view} />
@@ -1048,7 +1254,7 @@ export default function App() {
     const locatedDocuments = documents.filter((doc) => Number.isFinite(doc.report.latitude) && Number.isFinite(doc.report.longitude)).length
     return <><div className="hero-grid"><div className="panel map-panel"><PanelHeader icon={<MapPinned size={16} />} title={t('docWellLoc')} meta={`${locatedDocuments} / ${documents.length} · ${t('mapped', { count: locatedDocuments })}`} /><AllDocumentsMap documents={documents} activeName={document.name} onSelect={setActiveName} /></div><div className="panel depth-panel"><DepthPanel report={report} onOpenDive={() => setView('dive')} /></div><div className="panel document-panel"><DocumentPanel document={document} processing={processing} progress={progress} status={status} /></div></div><section className="panel subsurface-panel"><PanelHeader icon={<Waves size={16} />} title="SUBSURFACE 3D" meta={`${report.well_name || document.name} · VIDEX 3D`} /><Suspense fallback={<div className="subsurface-loading"><LoaderCircle className="ocr-spinner" size={22} /> Loading subsurface renderer…</div>}><SubsurfaceView report={report} /></Suspense></section><RiskRow risks={report.risks || []} events={report.events || []} openPrediction={() => setView('prediction')} /><TelemetryPanel report={report} /><div className="lower-grid"><div className="panel activity-panel"><StreamPanel document={document} status={status} /></div><div className="panel prediction-panel"><PredictionPanel document={document} question={question} setQuestion={setQuestion} /></div></div></>
   }
-  const heading = view === 'field' ? 'Observations from the field.' : view === 'command' ? t('headCommand') : view === 'dive' ? t('headDive') : view === 'documents' ? t('headDocs') : view === 'embeddings' ? t('headEmbed') : t('headPredict')
+  const heading = view === 'field' ? 'Observations from the field.' : view === 'library' ? t('headLibrary') : view === 'command' ? t('headCommand') : view === 'dive' ? t('headDive') : view === 'documents' ? t('headDocs') : view === 'embeddings' ? t('headEmbed') : t('headPredict')
   function onDragOver(event: React.DragEvent) { event.preventDefault(); if (!dragOver) setDragOver(true) }
   function onDragLeave(event: React.DragEvent) { if (!(event.currentTarget as HTMLElement).contains(event.relatedTarget as Node)) setDragOver(false) }
   async function onDrop(event: React.DragEvent) { event.preventDefault(); setDragOver(false); const files = event.dataTransfer.files; if (files && files.length) await ingestFiles(files) }
