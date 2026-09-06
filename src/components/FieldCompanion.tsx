@@ -23,26 +23,39 @@ function Scanner({ onRead, onClose, preferredCamera }: { onRead: (text: string) 
     if (!secure) { setError('Camera scanning requires HTTPS. Open the deployed NWIS site, or use Import update file.'); return }
     const reader = new BrowserQRCodeReader(new Map([[DecodeHintType.TRY_HARDER, true]]), { delayBetweenScanAttempts: 60, delayBetweenScanSuccess: 150, tryPlayVideoTimeout: 8000 })
     const constraints: MediaStreamConstraints = { audio: false, video: { facingMode: { ideal: preferredCamera }, width: { ideal: 3840, min: 1280 }, height: { ideal: 2160, min: 720 }, frameRate: { ideal: 30 } } }
-    reader.decodeFromConstraints(constraints, video.current!, (result) => {
-      if (!result || busy || stopped) return
-      busy = true
-      void callback.current(result.getText()).then(() => setError('')).catch(e => {
-        const message = String((e as Error).message)
-        if (!/Incomplete QR read|not an NWIS transfer QR/i.test(message)) setError(message)
-      }).finally(() => { busy = false })
-    }).then(controls => {
-      if (stopped) { controls.stop(); return }
-      stop = () => controls.stop()
-      const stream = video.current?.srcObject as MediaStream | null
-      const track = stream?.getVideoTracks()[0]
-      const settings = track?.getSettings()
-      setCamera(settings?.width && settings?.height ? `${settings.width} × ${settings.height} camera · high-accuracy scan active` : 'High-accuracy scan active')
-      const capabilities = track?.getCapabilities() as MediaTrackCapabilities & { focusMode?: string[] }
-      if (capabilities?.focusMode?.includes('continuous')) void track?.applyConstraints({ advanced: [{ focusMode: 'continuous' } as MediaTrackConstraintSet] }).catch(() => {})
-    }).catch(() => setError('Camera unavailable. Allow camera access in browser settings, then retry.'))
-    return () => { stopped = true; stop() }
+    const startTimer = window.setTimeout(() => {
+      if (stopped || !video.current) return
+      reader.decodeFromConstraints(constraints, video.current, (result) => {
+        if (!result || busy || stopped) return
+        busy = true
+        void callback.current(result.getText()).then(() => setError('')).catch(e => {
+          const message = String((e as Error).message)
+          if (!/Incomplete QR read|not an NWIS transfer QR/i.test(message)) setError(message)
+        }).finally(() => { busy = false })
+      }).then(controls => {
+        if (stopped) { controls.stop(); return }
+        stop = () => controls.stop()
+        const track = (video.current?.srcObject as MediaStream | null)?.getVideoTracks()[0]
+        const capabilities = track?.getCapabilities() as MediaTrackCapabilities & { focusMode?: string[] }
+        if (capabilities?.focusMode?.includes('continuous')) void track?.applyConstraints({ advanced: [{ focusMode: 'continuous' } as MediaTrackConstraintSet] }).catch(() => {})
+      }).catch(error => {
+        if (!stopped && (error as Error)?.name !== 'AbortError') setError('Camera unavailable. Allow camera access in browser settings, then retry.')
+      })
+    }, 150)
+    return () => {
+      stopped = true
+      window.clearTimeout(startTimer)
+      stop()
+      const element = video.current
+      const stream = element?.srcObject as MediaStream | null
+      stream?.getTracks().forEach(track => track.stop())
+      if (element) element.srcObject = null
+    }
   }, [preferredCamera])
-  return <div className="field-scan"><div className="field-scan-stage"><video ref={video} playsInline muted /><span className="field-scan-frame" aria-hidden="true" /></div><strong>{camera}</strong><p>{error || 'Place the entire QR inside the frame. Scanning continues automatically until the transfer is complete.'}</p><button onClick={onClose}>Stop camera</button></div>
+  return <div className="field-scan"><div className="field-scan-stage"><video ref={video} playsInline muted autoPlay onPlaying={() => {
+    const settings = ((video.current?.srcObject as MediaStream | null)?.getVideoTracks()[0])?.getSettings()
+    setCamera(settings?.width && settings?.height ? `${settings.width} × ${settings.height} camera · high-accuracy scan active` : 'High-accuracy scan active')
+  }} /><span className="field-scan-frame" aria-hidden="true" /></div><strong>{camera}</strong><p>{error || 'Place the entire QR inside the frame. Scanning continues automatically until the transfer is complete.'}</p><button onClick={onClose}>Stop camera</button></div>
 }
 function TransferQr({ frames }: { frames: string[] }) {
   const [index, setIndex] = useState(0), [paused, setPaused] = useState(false), [src, setSrc] = useState('')
